@@ -33,7 +33,7 @@ import numpy as np
 ML_CONFIG_COLLECTION = "system_stats"
 ML_CONFIG_DOC = "hoco_ml"
 FEATURE_PREFIX = "ml/features"
-FEATURE_SCHEMA_VERSION = 1
+FEATURE_SCHEMA_VERSION = 2   # 2: adds raw per-model fields in 6-hour valid-time blocks, by run age
 
 # One sample every 7 px. This matches the hover-point grid get_geojson_from_matrix
 # has always written, so legacy runs can be used for calibration too.
@@ -120,6 +120,16 @@ def sample_grid(field: np.ndarray) -> np.ndarray:
     return np.asarray(field, dtype=np.float32)[::CELL_PX, ::CELL_PX]
 
 
+def pool_grid(field: np.ndarray) -> np.ndarray:
+    """Average over each CELL_PX x CELL_PX cell (keeps sparse raw signals that point-sampling would miss)."""
+    f = np.asarray(field, dtype=np.float32)
+    h, w = f.shape
+    gh, gw = grid_shape(h, w)
+    pad = np.zeros((gh * CELL_PX, gw * CELL_PX), np.float32)
+    pad[:h, :w] = f
+    return pad.reshape(gh, CELL_PX, gw, CELL_PX).mean(axis=(1, 3))
+
+
 def grid_shape(h: int, w: int) -> tuple[int, int]:
     return (math.ceil(h / CELL_PX), math.ceil(w / CELL_PX))
 
@@ -143,10 +153,14 @@ def lonlat_to_cell(lon, lat, region: str, h: int, w: int):
 # ---------------------------------------------------------------------------
 # Feature logging
 # ---------------------------------------------------------------------------
-def build_feature_npz(model_fields: dict, ensemble_raw_smoothed: np.ndarray, region: str, meta: dict) -> bytes:
+def build_feature_npz(model_fields: dict, ensemble_raw_smoothed: np.ndarray, region: str, meta: dict,
+                      raw_blocks: list | None = None) -> bytes:
     """
     model_fields: {model: raw thunderstorm-risk field (H, W)} — unweighted by user weights.
     ensemble_raw_smoothed: the HOCO matrix after the display smoothing, BEFORE any calibration.
+    raw_blocks: [{model, rank, run, block, frames, field}] — UNSMOOTHED per-model signal summed over the
+        frames valid in one 6-hour block (block = start, UTC 'YYYYMMDDHH'); rank 0 = newest model run.
+        Lets training learn lead-time weights, run-age decay and per-model smoothing later.
     """
     h, w = ensemble_raw_smoothed.shape
     arrays = {
@@ -160,8 +174,19 @@ def build_feature_npz(model_fields: dict, ensemble_raw_smoothed: np.ndarray, reg
         arrays[f"m_{model}"] = sample_grid(smooth(field)).astype(np.float16)
         present.append(model)
 
+    blocks_meta = []
+    for i, b in enumerate(raw_blocks or []):
+        model = canonical_model(b.get("model"))
+        if model not in LIGHTNING_MODELS or b.get("field") is None:
+            continue
+        key = f"r{i}"
+        arrays[key] = pool_grid(b["field"]).astype(np.float16)
+        blocks_meta.append({"key": key, "model": model, "rank": int(b.get("rank", 0)), "run": str(b.get("run")),
+                            "block": str(b.get("block")), "frames": int(b.get("frames", 0))})
+
     meta = dict(meta)
     meta.update({
+        "raw_blocks": blocks_meta,
         "schema": FEATURE_SCHEMA_VERSION,
         "region": region,
         "height": int(h),
@@ -273,4 +298,3 @@ def predict_method(entry: dict, x_ens: np.ndarray, model_fields: dict) -> np.nda
         shape = np.shape(x_ens)
         return apply_logistic(model_fields, params, shape)
     return apply_isotonic(x_ens, params)
-
