@@ -42,12 +42,15 @@ from scipy.optimize import minimize
 import hoco_ml
 import hoco_context
 
+# Daily archives (copied from the Met Office feed once a day) + the live Met Office feed,
+# which holds roughly the last 48 h and so covers the gap since the last archive copy.
 LIGHTNING_URLS = [
     "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new/refs/heads/main/lightning_data.json",
     "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new/refs/heads/main/lightning_data_2025_autumn.json",
     "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new_2026/refs/heads/main/lightning_data_2026_summer_part1.json",
     "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new_2026/refs/heads/main/lightning_data_2026_summer.json",
 ]
+METOFFICE_LIGHTNING_URL = "https://data.consumer-digital.api.metoffice.gov.uk/v1/lightning"
 ROWS_BLOB = "ml/training_rows.npz"
 ROLLING_DAYS = 365                # default look-back; --since overrides
 MAX_NEW_RUNS_PER_PASS = 600       # --max-runs overrides (use ~4000 for the first backlog pass)
@@ -155,28 +158,90 @@ def parse_strike(s):
     return lon, lat, t
 
 
+def extract_strike_list(data):
+    """All feeds use {"lightning_strikes": [{"strike_time", "coordinates": [lon, lat]}]}; older shapes kept as fallbacks."""
+    if isinstance(data, list):
+        return data
+    if not isinstance(data, dict):
+        return []
+    for key in ("lightning_strikes", "strikes", "features", "data"):
+        if isinstance(data.get(key), list):
+            return data[key]
+    return []
+
+
+def _get_json(url, timeout=120):
+    res = requests.get(url, timeout=timeout, headers={"Accept": "application/json"})
+    res.raise_for_status()
+    return res.json()
+
+
+def fetch_metoffice_strikes():
+    """Live Met Office feed + every extra page listed in `chunks` (busy periods are split)."""
+    base = _get_json(METOFFICE_LIGHTNING_URL, timeout=60)
+    strikes = list(extract_strike_list(base))
+    chunks = (base.get("chunks") or []) if isinstance(base, dict) else []
+    for c in chunks:
+        n = c.get("chunk") if isinstance(c, dict) else c
+        if n is None:
+            continue
+        try:
+            # same chunk URL the HOCO website uses
+            strikes += extract_strike_list(_get_json(f"{METOFFICE_LIGHTNING_URL}?last-minutes=1&chunk={n}", timeout=60))
+        except Exception as e:
+            print(f"[LIGHTNING] Met Office chunk {n} failed: {e}")
+    print(f"[LIGHTNING] {len(strikes)} from Met Office live feed ({len(chunks)} extra chunks, "
+          f"last_update {base.get('last_update') if isinstance(base, dict) else '?'})")
+    return strikes
+
+
+def strike_key(s):
+    """Exact identity of a strike: the same strike in the archive and the live feed has the same key."""
+    if not isinstance(s, dict):
+        return None
+    c = s.get("coordinates") or (s.get("geometry") or {}).get("coordinates")
+    t = s.get("strike_time")
+    if not t or not isinstance(c, list) or len(c) < 2:
+        return None
+    try:
+        return (str(t), round(float(c[0]), 4), round(float(c[1]), 4))
+    except (TypeError, ValueError):
+        return None
+
+
 def load_strikes():
-    raw = []
+    raw, sources = [], 0
     for url in LIGHTNING_URLS:
         try:
-            res = requests.get(url, timeout=60)
-            res.raise_for_status()
-            data = res.json()
-            arr = data if isinstance(data, list) else (
-                data.get("features") or data.get("strikes") or data.get("data")
-                or next((v for v in data.values() if isinstance(v, list)), []))
+            arr = extract_strike_list(_get_json(url))
             raw.extend(arr)
-            print(f"[LIGHTNING] {len(arr)} from {url}")
+            sources += 1
+            print(f"[LIGHTNING] {len(arr)} from {url.rsplit('/', 1)[-1]}")
         except Exception as e:
             print(f"[LIGHTNING] Failed {url}: {e}")
-    parsed = [p for p in (parse_strike(s) for s in raw) if p]
+    try:
+        raw.extend(fetch_metoffice_strikes())
+        sources += 1
+    except Exception as e:
+        print(f"[LIGHTNING] Met Office live feed failed ({e}); using archives only.")
+
+    # De-duplicate: the live feed overlaps the latest daily archive copy
+    seen, unique, dupes = set(), [], 0
+    for s in raw:
+        k = strike_key(s)
+        if k is not None:
+            if k in seen:
+                dupes += 1
+                continue
+            seen.add(k)
+        unique.append(s)
+    parsed = [p for p in (parse_strike(s) for s in unique) if p]
     if not parsed:
         raise RuntimeError("No lightning strikes could be parsed — cannot label training data.")
     arr = np.array(parsed, dtype=np.float64)
-    arr = np.unique(np.round(arr, 5), axis=0)  # archives can overlap; drop exact duplicate strikes
-    order = np.argsort(arr[:, 2])
-    arr = arr[order]
-    print(f"[LIGHTNING] Parsed {len(arr)}/{len(raw)} strikes, "
+    arr = arr[np.argsort(arr[:, 2])]
+    print(f"[LIGHTNING] {len(raw)} read from {sources} sources, {dupes} duplicates removed, "
+          f"{len(arr)} parsed ({len(unique) - len(parsed)} unreadable). "
           f"{datetime.fromtimestamp(arr[0, 2] / 1000, timezone.utc):%Y-%m-%d} → "
           f"{datetime.fromtimestamp(arr[-1, 2] / 1000, timezone.utc):%Y-%m-%d %H:%M}Z")
     return arr  # columns lon, lat, t_ms (sorted by time)
