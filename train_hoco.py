@@ -43,8 +43,10 @@ import hoco_ml
 import hoco_context
 
 LIGHTNING_URLS = [
-    "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new/main/lightning_data.json",
-    "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new/main/lightning_data_2025_autumn.json",
+    "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new/refs/heads/main/lightning_data.json",
+    "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new/refs/heads/main/lightning_data_2025_autumn.json",
+    "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new_2026/refs/heads/main/lightning_data_2026_summer_part1.json",
+    "https://raw.githubusercontent.com/HandryOutlook/lightning_data_new_2026/refs/heads/main/lightning_data_2026_summer.json",
 ]
 ROWS_BLOB = "ml/training_rows.npz"
 ROLLING_DAYS = 365                # default look-back; --since overrides
@@ -171,6 +173,7 @@ def load_strikes():
     if not parsed:
         raise RuntimeError("No lightning strikes could be parsed — cannot label training data.")
     arr = np.array(parsed, dtype=np.float64)
+    arr = np.unique(np.round(arr, 5), axis=0)  # archives can overlap; drop exact duplicate strikes
     order = np.argsort(arr[:, 2])
     arr = arr[order]
     print(f"[LIGHTNING] Parsed {len(arr)}/{len(raw)} strikes, "
@@ -1200,3 +1203,4 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
+
