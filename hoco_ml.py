@@ -40,11 +40,11 @@ FEATURE_SCHEMA_VERSION = 1
 CELL_PX = 7
 SMOOTH_KERNEL = (11, 11)
 
-# Lightning-capable models, fixed column order for the training matrix.
-LIGHTNING_MODELS = ["rpdid2", "swisseu", "ez", "swissnow", "ezswiss", "ukmo2km", "swissmrf", "hardmi"]
+# Lightning-capable models by CODE NAME, fixed column order for the training matrix.
+# Real model names never leave the private backend: cloud.py translates them to these
+# codes before anything is uploaded, so the trainer, Firestore and the website only see codes.
+LIGHTNING_MODELS = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
 
-# The website historically used "harmi" for HARMONIE-DMI; the backend key is "hardmi".
-MODEL_ALIASES = {"harmi": "hardmi", "harmonie": "hardmi"}
 
 REGION_BOUNDS = {
     "England": {"top": 56.578, "bottom": 48.788, "left": -10.234, "right": 5.471},
@@ -80,8 +80,7 @@ AI_REGIONS = {"England", "Scotland", "UK", "Wales", "Ireland and Northern Irelan
 
 
 def canonical_model(name: str) -> str:
-    key = str(name or "").strip().lower()
-    return MODEL_ALIASES.get(key, key)
+    return str(name or "").strip().lower()
 
 
 def region_bounds(region: str) -> dict:
