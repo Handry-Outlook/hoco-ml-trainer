@@ -1,0 +1,319 @@
+"""
+hoco_context.py — weather "context" for AI HOCO.
+
+The basic AI HOCO only learns how much to trust each model. This module adds the
+things a forecaster would weigh up from experience:
+
+  * WHERE storms tend / tend not to happen      -> lightning climatology map per grid cell
+  * the SETUP (low-level flow sector x season)  -> climatology map for that setup, e.g.
+        "cold-season westerly": storms favour exposed west coasts / windward high ground and
+        are rare inland. This is how orographic and coastal effects get in without needing
+        a terrain model: they show up in where lightning actually happened in each setup.
+  * SEASON and instability (CAPE)               -> lets trust in the models change with the
+        time of year, e.g. learning that winter westerly signals are over-forecast
+  * STORM MOTION (500 hPa steering flow)        -> a copy of the model signal moved
+        downstream, so AI HOCO can learn if the models tend to be slow with storms
+
+Upper-air data comes from Open-Meteo (free, no key; non-commercial licence):
+  live runs   -> api.open-meteo.com/v1/forecast                (forecast at issue time)
+  training    -> historical-forecast-api.open-meteo.com/v1/forecast (archived forecasts, 2022+)
+Every lookup is best-effort: if it fails, context features fall back to neutral values
+and AI HOCO behaves like the weights-only model.
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import math
+from datetime import datetime, timedelta, timezone
+
+import cv2
+import numpy as np
+import requests
+
+import hoco_ml
+
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
+HISTORICAL_URL = "https://historical-forecast-api.open-meteo.com/v1/forecast"
+HOURLY_VARS = ["wind_speed_850hPa", "wind_direction_850hPa", "wind_speed_500hPa", "wind_direction_500hPa", "cape"]
+
+SETUPS = ["northerly", "easterly", "southerly", "westerly", "slack"]
+SEASONS = ["cold", "warm"]  # cold = Oct-Mar, warm = Apr-Sep
+SLACK_MS = 5.0
+DOWNSTREAM_HOURS = 1.0
+SETUP_SHRINK_DAYS = 30.0    # setup maps lean on the overall climatology until a setup has ~30 days
+CLIM_SMOOTH_CELLS = 1.5
+
+# Anchor points used to describe the region's flow (averaged)
+ANCHORS = {
+    "England": [(50.7, -3.5), (52.5, -1.5), (54.3, -2.0), (51.5, 0.5)],
+    "Scotland": [(55.9, -4.2), (57.3, -4.3), (56.5, -2.8)],
+    "UK": [(50.7, -3.5), (52.5, -1.5), (54.6, -6.0), (56.5, -4.0)],
+    "Wales": [(52.3, -3.7)],
+    "Ireland and Northern Ireland": [(53.4, -7.7), (54.6, -6.5)],
+}
+
+CONTEXT_COLS = ["f_clim", "f_setup", "cos_doy", "sin_doy", "cape_n", "s_cos", "s_setup", "s_cape"]
+CONTEXT_LABELS = {
+    "f_clim": "Where lightning usually happens",
+    "f_setup": "Where lightning happens in this setup",
+    "cos_doy": "Time of year (winter vs summer)",
+    "sin_doy": "Time of year (spring vs autumn)",
+    "cape_n": "Instability (CAPE)",
+    "s_cos": "Trust in models by season",
+    "s_setup": "Trust in models by setup & place",
+    "s_cape": "Trust in models by instability",
+}
+
+
+# ---------------------------------------------------------------------------
+# Upper-air context
+# ---------------------------------------------------------------------------
+def anchors_for(region: str):
+    if region in ANCHORS:
+        return ANCHORS[region]
+    b = hoco_ml.region_bounds(region)
+    return [((b["top"] + b["bottom"]) / 2, (b["left"] + b["right"]) / 2)]
+
+
+def wind_to_uv(speed, direction_from_deg):
+    rad = np.deg2rad(direction_from_deg)
+    return -speed * np.sin(rad), -speed * np.cos(rad)
+
+
+def fetch_hourly(region: str, start: datetime, end: datetime, historical: bool = False, timeout: int = 60):
+    """Region-averaged hourly series {iso_hour: (u850, v850, u500, v500, cape)}. Raises on failure."""
+    pts = anchors_for(region)
+    params = {
+        "latitude": ",".join(f"{p[0]:.3f}" for p in pts),
+        "longitude": ",".join(f"{p[1]:.3f}" for p in pts),
+        "hourly": ",".join(HOURLY_VARS),
+        "wind_speed_unit": "ms",
+        "timezone": "GMT",
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+    }
+    res = requests.get(HISTORICAL_URL if historical else FORECAST_URL, params=params, timeout=timeout)
+    res.raise_for_status()
+    data = res.json()
+    blocks = data if isinstance(data, list) else [data]
+    acc = {}
+    for blk in blocks:
+        hr = blk.get("hourly") or {}
+        times = hr.get("time") or []
+        cols = [np.array([np.nan if v is None else v for v in hr.get(k, [None] * len(times))], dtype=float) for k in HOURLY_VARS]
+        u850, v850 = wind_to_uv(cols[0], cols[1])
+        u500, v500 = wind_to_uv(cols[2], cols[3])
+        for i, t in enumerate(times):
+            acc.setdefault(t, []).append((u850[i], v850[i], u500[i], v500[i], cols[4][i]))
+    return {t: tuple(np.nanmean(np.array(v), axis=0).tolist()) for t, v in acc.items()}
+
+
+def setup_index(u850, v850):
+    speed = math.hypot(u850, v850)
+    if not np.isfinite(speed) or speed < SLACK_MS:
+        return SETUPS.index("slack")
+    direction_from = (math.degrees(math.atan2(-u850, -v850)) + 360) % 360
+    if direction_from >= 315 or direction_from < 45:
+        return SETUPS.index("northerly")
+    if direction_from < 135:
+        return SETUPS.index("easterly")
+    if direction_from < 225:
+        return SETUPS.index("southerly")
+    return SETUPS.index("westerly")
+
+
+def season_index(dt: datetime):
+    return 0 if dt.month in (10, 11, 12, 1, 2, 3) else 1
+
+
+def summarize_window(series: dict, start: datetime, end: datetime) -> dict | None:
+    vals = []
+    t = start.replace(minute=0, second=0, microsecond=0)
+    while t <= end:
+        v = series.get(t.strftime("%Y-%m-%dT%H:%M"))
+        if v is not None:
+            vals.append(v)
+        t += timedelta(hours=1)
+    if not vals:
+        return None
+    arr = np.array(vals, dtype=float)
+    mean = np.nanmean(arr, axis=0)
+    cape = float(np.nanpercentile(arr[:, 4], 75)) if np.isfinite(arr[:, 4]).any() else 0.0
+    mid = start + (end - start) / 2
+    doy = mid.timetuple().tm_yday
+    return {
+        "u850": float(mean[0]), "v850": float(mean[1]), "u500": float(mean[2]), "v500": float(mean[3]),
+        "cape": cape if np.isfinite(cape) else 0.0,
+        "setup": setup_index(mean[0], mean[1]), "season": season_index(mid), "doy": doy,
+    }
+
+
+def run_context(region: str, start: datetime, end: datetime, historical: bool = False) -> dict | None:
+    try:
+        series = fetch_hourly(region, start - timedelta(hours=1), end + timedelta(hours=1), historical=historical)
+        return summarize_window(series, start, end)
+    except Exception as e:
+        print(f"[CONTEXT] Upper-air lookup failed ({e}); using neutral context.")
+        return None
+
+
+def describe(ctx: dict | None) -> str:
+    if not ctx:
+        return "unknown setup"
+    return f"{SEASONS[ctx['season']]}-season {SETUPS[ctx['setup']]}"
+
+
+# ---------------------------------------------------------------------------
+# Climatology maps
+# ---------------------------------------------------------------------------
+def map_key(region, h, w):
+    return f"{region}|{int(h)}|{int(w)}"
+
+
+def build_climatology(strikes: np.ndarray, daily_setup: dict, region: str, h: int, w: int, cutoff_ms: float | None = None):
+    """
+    strikes: (N,3) lon, lat, t_ms. daily_setup: {'YYYY-MM-DD': (setup_idx, season_idx)} for every day
+    in the archive (lightning or not). Uses only days strictly before cutoff_ms.
+    Returns {'clim': (gh,gw), 'setup': (len(SETUPS)*len(SEASONS), gh, gw), 'days': [...]} in logit units.
+    """
+    gh, gw = hoco_ml.grid_shape(h, w)
+    days = sorted(d for d in daily_setup
+                  if cutoff_ms is None or datetime.fromisoformat(d).replace(tzinfo=timezone.utc).timestamp() * 1000 < cutoff_ms - 86400000)
+    n_combo = len(SETUPS) * len(SEASONS)
+    counts = np.zeros((gh, gw), np.float32)
+    counts_s = np.zeros((n_combo, gh, gw), np.float32)
+    ndays_s = np.zeros(n_combo, np.float32)
+    if not days:
+        return None
+    day_index = {d: i for i, d in enumerate(days)}
+    st = strikes if cutoff_ms is None else strikes[strikes[:, 2] < cutoff_ms]
+    r, c = hoco_ml.lonlat_to_cell(st[:, 0], st[:, 1], region, h, w)
+    ok = r >= 0
+    dates = np.array([datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d") for t in st[ok, 2]])
+    rr, cc = r[ok], c[ok]
+    for d in days:
+        combo = daily_setup[d][0] * len(SEASONS) + daily_setup[d][1]
+        ndays_s[combo] += 1
+    kernel = np.ones((3, 3), np.uint8)
+    for d in np.unique(dates):
+        if d not in day_index:
+            continue
+        m = dates == d
+        grid = np.zeros((gh, gw), np.uint8)
+        grid[rr[m], cc[m]] = 1
+        grid = cv2.dilate(grid, kernel).astype(np.float32)  # "within ~10 km"
+        counts += grid
+        combo = daily_setup[d][0] * len(SEASONS) + daily_setup[d][1]
+        counts_s[combo] += grid
+    n = float(len(days))
+    blur = lambda a: cv2.GaussianBlur(a, (0, 0), CLIM_SMOOTH_CELLS)
+    freq = np.clip(blur(counts) / n, 1e-4, 0.6)
+    logit = lambda p: np.log(p / (1 - p))
+    f_all = logit(freq)
+    clim = (f_all - f_all.mean()).astype(np.float32)
+    setup = np.zeros((n_combo, gh, gw), np.float32)
+    for k in range(n_combo):
+        shrunk = (blur(counts_s[k]) + SETUP_SHRINK_DAYS * freq) / (ndays_s[k] + SETUP_SHRINK_DAYS)
+        setup[k] = logit(np.clip(shrunk, 1e-4, 0.6)) - f_all
+    return {"clim": clim, "setup": setup, "days": int(n), "setupDays": ndays_s.tolist()}
+
+
+def save_climatology(maps: dict) -> bytes:
+    arrays, meta = {}, {}
+    for key, m in maps.items():
+        if m is None:
+            continue
+        arrays[f"clim::{key}"] = m["clim"].astype(np.float16)
+        arrays[f"setup::{key}"] = m["setup"].astype(np.float16)
+        meta[key] = {"days": m["days"], "setupDays": m["setupDays"]}
+    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8)
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    return buf.getvalue()
+
+
+def load_climatology(data: bytes) -> dict:
+    out = {}
+    with np.load(io.BytesIO(data), allow_pickle=False) as npz:
+        meta = json.loads(bytes(npz["meta"]).decode())
+        for key in meta:
+            out[key] = {"clim": npz[f"clim::{key}"].astype(np.float32), "setup": npz[f"setup::{key}"].astype(np.float32), **meta[key]}
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Feature construction (shared by training and inference so they always match)
+# ---------------------------------------------------------------------------
+def model_mean(fields: dict, models: list):
+    present = [fields[m] for m in models if m in fields and fields[m] is not None]
+    if not present:
+        return None
+    return sum(np.nan_to_num(np.maximum(f, 0), nan=0.0) for f in present) / len(present)
+
+
+def shift_downstream(field: np.ndarray, ctx: dict | None, region: str, h: int, w: int, hours: float = DOWNSTREAM_HOURS):
+    """Move a (H', W') field along the 500 hPa steering flow. Works on pixel or sample grids."""
+    if ctx is None or field is None:
+        return field
+    b = hoco_ml.region_bounds(region)
+    fh, fw = field.shape
+    lat0 = math.radians((b["top"] + b["bottom"]) / 2)
+    km_per_px_x = (b["right"] - b["left"]) * 111.32 * math.cos(lat0) / fw
+    km_per_px_y = (b["top"] - b["bottom"]) * 110.57 / fh
+    dist_x = ctx["u500"] * 3.6 * hours / km_per_px_x
+    dist_y = -ctx["v500"] * 3.6 * hours / km_per_px_y
+    m = np.float32([[1, 0, dist_x], [0, 1, dist_y]])
+    return cv2.warpAffine(field.astype(np.float32), m, (fw, fh), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def run_scalars(ctx: dict | None):
+    if not ctx:
+        return 0.0, 0.0, 0.0
+    ang = 2 * math.pi * (ctx["doy"] - 15) / 365.25  # cos = +1 in mid-January
+    return math.cos(ang), math.sin(ang), math.log1p(max(ctx.get("cape", 0.0), 0.0)) / math.log1p(1000.0)
+
+
+def clim_lookup(maps: dict | None, region: str, h: int, w: int, ctx: dict | None):
+    """(f_clim, f_setup) grids for this region/size and setup, or zeros if unavailable."""
+    gh, gw = hoco_ml.grid_shape(h, w)
+    m = (maps or {}).get(map_key(region, h, w))
+    if m is None:
+        return np.zeros((gh, gw), np.float32), np.zeros((gh, gw), np.float32)
+    f_setup = np.zeros((gh, gw), np.float32)
+    if ctx:
+        f_setup = m["setup"][ctx["setup"] * len(SEASONS) + ctx["season"]]
+    return m["clim"], f_setup
+
+
+def context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n):
+    """Columns in CONTEXT_COLS order; inputs are same-shape arrays or scalars."""
+    S = np.asarray(S, dtype=np.float64)
+    ones = np.ones_like(S)
+    return [np.asarray(f_clim) * ones, np.asarray(f_setup) * ones, cos_d * ones, sin_d * ones, cape_n * ones,
+            S * cos_d, S * np.asarray(f_setup), S * cape_n]
+
+
+def apply_context_model(smoothed_fields: dict, params: dict, ctx: dict | None, maps: dict | None, region: str, shape):
+    """Pixel-level probability from a 'context' model."""
+    h, w = shape
+    models = params.get("models") or list((params.get("weights") or {}).keys())
+    z = np.full(shape, float(params.get("intercept", -4.0)), dtype=np.float64)
+    for m, wt in (params.get("weights") or {}).items():
+        f = smoothed_fields.get(m)
+        if f is not None and wt:
+            z += float(wt) * np.maximum(f, 0)
+    S = model_mean(smoothed_fields, models)
+    if S is None:
+        S = np.zeros(shape, np.float32)
+    z += float(params.get("downstream", 0.0)) * shift_downstream(S, ctx, region, h, w)
+    f_clim, f_setup = clim_lookup(maps, region, h, w, ctx)
+    f_clim = cv2.resize(f_clim, (w, h), interpolation=cv2.INTER_LINEAR)
+    f_setup = cv2.resize(f_setup, (w, h), interpolation=cv2.INTER_LINEAR)
+    cos_d, sin_d, cape_n = run_scalars(ctx)
+    cols = context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n)
+    coefs = params.get("context") or {}
+    for name, col in zip(CONTEXT_COLS, cols):
+        z += float(coefs.get(name, 0.0)) * col
+    return hoco_ml.sigmoid(z).astype(np.float32)

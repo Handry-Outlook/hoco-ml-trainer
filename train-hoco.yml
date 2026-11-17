@@ -1,0 +1,64 @@
+# AI HOCO training. Lives in the PUBLIC repo Handry-Outlook/hoco-ml-trainer at
+# .github/workflows/train-hoco.yml, so it uses no paid/limited Actions minutes.
+# Needs the repo secret FIREBASE_SERVICE_ACCOUNT.
+#
+# No cron here on purpose: GitHub turns off cron schedules in public repos after 60 days
+# without commits. The Firebase function `dailyAiTraining` starts it every day at 03:40 UTC
+# instead, and the Lab's "Run training now" button starts it on demand.
+name: Train HOCO weights
+
+on:
+  workflow_dispatch:
+    inputs:
+      rebuild:
+        description: "Rebuild the training cache from scratch"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Train and report only (do not publish)"
+        type: boolean
+        default: false
+      since:
+        description: "Only use runs ending on/after this date (YYYY-MM-DD), e.g. 2026-04-01"
+        type: string
+        default: ""
+      max_runs:
+        description: "New runs to ingest this pass (use 4000 to clear a backlog)"
+        type: string
+        default: "600"
+
+concurrency:
+  group: train-hoco
+  cancel-in-progress: false
+
+jobs:
+  train:
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-train.txt
+          python -m pip install --force-reinstall \
+            "google-api-core==2.34.0" \
+            "google-cloud-firestore==2.28.1"
+          python -m pip check
+
+      - name: Train and publish
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+        run: |
+          ARGS=""
+          if [ "${{ inputs.rebuild }}" = "true" ]; then ARGS="$ARGS --rebuild"; fi
+          if [ "${{ inputs.dry_run }}" = "true" ]; then ARGS="$ARGS --dry-run"; fi
+          if [ -n "${{ inputs.since }}" ]; then ARGS="$ARGS --since ${{ inputs.since }}"; fi
+          if [ -n "${{ inputs.max_runs }}" ]; then ARGS="$ARGS --max-runs ${{ inputs.max_runs }}"; fi
+          python train_hoco.py $ARGS
