@@ -279,36 +279,52 @@ def label_grid(strikes, region, h, w):
     return label
 
 
+DEFAULT_SHAPE = (620, 800)   # cloud.py crops every chart to 620 rows; 800 is the default width
+SHAPE_HINT = {}              # region -> (h, w) learned from runs where it could be measured
+
+
 def legacy_ensemble_grid(geojson, region):
-    """Rebuild the 7 px point grid from an old geojson (risk% -> prob)."""
-    pts = []
-    for f in geojson.get("features", []):
+    """
+    Rebuild the 7 px point grid from an old geojson (risk% -> prob).
+    Returns (grid, h, w, how) or (None, None, None, reason).
+    A forecast with no risk anywhere has no points: that is a valid all-zero forecast, not an error.
+    """
+    pts, polys = [], 0
+    for f in geojson.get("features", []) or []:
         props = f.get("properties") or {}
         geom = f.get("geometry") or {}
-        if props.get("feature_type") != "point" or geom.get("type") != "Point":
-            continue
-        lon, lat = geom["coordinates"][:2]
-        pts.append((lon, lat, float(props.get("risk", 0)) / 100.0))
-    if len(pts) < 4:
-        return None
+        if props.get("feature_type") == "point" and geom.get("type") == "Point":
+            lon, lat = geom["coordinates"][:2]
+            pts.append((lon, lat, float(props.get("risk", 0) or 0) / 100.0))
+        elif geom.get("type") in ("Polygon", "MultiPolygon"):
+            polys += 1
+
+    hint = SHAPE_HINT.get(region, DEFAULT_SHAPE)
+    if not pts:
+        if polys:
+            return None, None, None, "polygons but no point grid"
+        h, w = hint
+        return np.zeros(hoco_ml.grid_shape(h, w), dtype=np.float32), h, w, "legacy (no risk forecast)"
+
     pts = np.array(pts)
+    h, w = hint
     b = hoco_ml.region_bounds(region)
     ulon = np.unique(np.round(pts[:, 0], 4))
     ulat = np.unique(np.round(pts[:, 1], 4))
-    if len(ulon) < 2 or len(ulat) < 2:
-        return None
-    dlon = np.median(np.diff(ulon))
-    dlat = np.median(np.diff(ulat))
-    w = int(round(hoco_ml.CELL_PX * (b["right"] - b["left"]) / dlon))
-    h = int(round(hoco_ml.CELL_PX * (b["top"] - b["bottom"]) / dlat))
-    if not (100 < w < 4000 and 100 < h < 4000):
-        return None
+    if len(ulon) >= 3 and len(ulat) >= 3:
+        dlon = np.min(np.diff(ulon))
+        dlat = np.min(np.diff(ulat))
+        mw = int(round(hoco_ml.CELL_PX * (b["right"] - b["left"]) / dlon)) if dlon > 0 else 0
+        mh = int(round(hoco_ml.CELL_PX * (b["top"] - b["bottom"]) / dlat)) if dlat > 0 else 0
+        if 100 < mw < 4000 and 100 < mh < 4000:
+            h, w = mh, mw
+            SHAPE_HINT[region] = (h, w)
     gh, gw = hoco_ml.grid_shape(h, w)
     grid = np.zeros((gh, gw), dtype=np.float32)
     r, c = hoco_ml.lonlat_to_cell(pts[:, 0], pts[:, 1], region, h, w)
     ok = r >= 0
     grid[r[ok], c[ok]] = np.maximum(grid[r[ok], c[ok]], pts[ok, 2])
-    return grid, h, w
+    return grid, h, w, "legacy"
 
 
 def rows_from_grids(run_idx, bucket_idx, t_end_days, x_ens, label, model_grids, rng, region="England",
@@ -371,6 +387,7 @@ def build_run_rows(run_id, run, strikes, gcs, run_idx, rng):
     if blob.exists():
         meta, arrays = hoco_ml.read_feature_npz(blob.download_as_bytes())
         h, w = meta["height"], meta["width"]
+        SHAPE_HINT[region] = (h, w)
         x_ens = np.clip(arrays["ensemble"] * 0.2, 0, 1)  # raw ensemble, BEFORE calibration
         model_grids = {k[2:]: v for k, v in arrays.items() if k.startswith("m_")}
         label = label_grid(win, region, h, w)
@@ -398,13 +415,14 @@ def build_run_rows(run_id, run, strikes, gcs, run_idx, rng):
         return None, f"bad geojson: {e}"
     if isinstance(geo, dict) and (geo.get("properties") or {}).get("hoco_layout") == "bands_v2":
         return None, "bands_v2 geojson without feature log"
-    built = legacy_ensemble_grid(geo, region)
-    if built is None:
-        return None, "no point grid"
-    x_ens, h, w = built
+    x_ens, h, w, how = legacy_ensemble_grid(geo if isinstance(geo, dict) else {}, region)
+    if x_ens is None:
+        n = len((geo or {}).get("features", []) or []) if isinstance(geo, dict) else 0
+        print(f"[RUNS] skipped {run_id}: {how} ({n} features)")
+        return None, how
     label = label_grid(win, region, h, w)
     return rows_from_grids(run_idx, bucket_idx, end.timestamp() / 86400, x_ens, label, None, rng,
-                           region=region, size=(h, w)), "legacy"
+                           region=region, size=(h, w)), how
 
 
 # ============================================================================
