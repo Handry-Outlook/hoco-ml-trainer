@@ -1155,7 +1155,7 @@ def main():
         print(f"[RUNS] Incremental read: runs created since {recent:%Y-%m-%d}.")
     else:
         snap = col.where("type", "in", ["automated", "ai_training"]).stream()
-    todo = []
+    todo, skipped_regions = [], {}
     for doc in snap:
         if doc.id in done:
             continue
@@ -1164,10 +1164,18 @@ def main():
             continue
         if run.get("status") != "completed":
             continue
+        region = run.get("region") or "England"
+        if isinstance(region, list):
+            region = region[0] if region else "England"
+        if region not in hoco_ml.AI_REGIONS:
+            skipped_regions[region] = skipped_regions.get(region, 0) + 1
+            continue  # no lightning observations there to verify against
         end = parse_hoco_time(run.get("endTime") or run.get("startTime"))
         if not end or end < oldest or end > coverage_end:
             continue  # too old, or lightning observations don't cover it yet
         todo.append((end, doc.id, run))
+    if skipped_regions:
+        print(f"[RUNS] Ignored runs outside lightning coverage: {skipped_regions}")
     todo.sort(key=lambda t: t[0])
     backlog = len(todo)
     todo = todo[:max(1, args.max_runs)]
