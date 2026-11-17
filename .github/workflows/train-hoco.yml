@@ -48,9 +48,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-train.txt
-          python -m pip install --force-reinstall \
-            "google-api-core==2.34.0" \
-            "google-cloud-firestore==2.28.1"
           python -m pip check
 
       - name: Train and publish
