@@ -72,6 +72,13 @@ RISK_BANDS = [
 ]
 
 
+# Regions inside the lightning observation coverage (Met Office feed + archives:
+# roughly 18W-8E, 48.5N-63N). Only these are used for training, and only these get
+# AI HOCO runs. Germany, Poland, the Baltics etc. have no verifying lightning data, so
+# training on them would teach the model that storms there never happen.
+AI_REGIONS = {"England", "Scotland", "UK", "Wales", "Ireland and Northern Ireland"}
+
+
 def canonical_model(name: str) -> str:
     key = str(name or "").strip().lower()
     return MODEL_ALIASES.get(key, key)
@@ -267,3 +274,4 @@ def predict_method(entry: dict, x_ens: np.ndarray, model_fields: dict) -> np.nda
         shape = np.shape(x_ens)
         return apply_logistic(model_fields, params, shape)
     return apply_isotonic(x_ens, params)
+
