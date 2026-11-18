@@ -33,6 +33,7 @@ import json
 import os
 import re
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -493,18 +494,31 @@ class ContextEnv:
             if day.strftime("%Y-%m-%dT12:00") not in ser:
                 missing.append(day)
             day += timedelta(days=1)
-        i = 0
+        # Small pieces with retries: one slow Open-Meteo reply must not throw away the whole history.
+        i, bad_chunks = 0, 0
         while i < len(missing):
-            chunk = missing[i:i + 90]
-            try:
-                got = hoco_context.fetch_hourly(region, chunk[0], chunk[-1], historical=True)
+            chunk = missing[i:i + 30]
+            got = None
+            for attempt in range(3):
+                try:
+                    got = hoco_context.fetch_hourly(region, chunk[0], chunk[-1], historical=True, timeout=150)
+                    break
+                except Exception as e:
+                    wait = 10 * (attempt + 1)
+                    print(f"[CONTEXT] {region} {chunk[0]:%Y-%m-%d}→{chunk[-1]:%Y-%m-%d} attempt {attempt + 1} failed ({e}); "
+                          f"{'retrying in ' + str(wait) + ' s' if attempt < 2 else 'skipping this piece'}")
+                    if attempt < 2:
+                        time.sleep(wait)
+            if got:
                 ser.update({k: list(v) for k, v in got.items()})
                 self.dirty.add(region)
-            except Exception as e:
-                print(f"[CONTEXT] History fetch failed for {region} ({e}); context will be neutral where missing.")
-                self.failed.add(region)
-                break
-            i += 90
+            else:
+                bad_chunks += 1
+                if bad_chunks >= 4:
+                    print(f"[CONTEXT] Open-Meteo keeps failing for {region}; context will be neutral where missing.")
+                    self.failed.add(region)
+                    break
+            i += 30
         return ser
 
     def run_ctx(self, region, start, end):
@@ -1294,4 +1308,3 @@ def main():
 
 if __name__ == "__main__":
     sys.exit(main())
-
