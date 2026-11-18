@@ -196,27 +196,35 @@ def build_climatology(strikes: np.ndarray, daily_setup: dict, region: str, h: in
     for d in days:
         combo = daily_setup[d][0] * len(SEASONS) + daily_setup[d][1]
         ndays_s[combo] += 1
-    kernel = np.ones((3, 3), np.uint8)
+    kernel = hoco_ml.neighbourhood_kernel(region, h, w)   # same "within 20 km" as the training labels
     for d in np.unique(dates):
         if d not in day_index:
             continue
         m = dates == d
         grid = np.zeros((gh, gw), np.uint8)
         grid[rr[m], cc[m]] = 1
-        grid = cv2.dilate(grid, kernel).astype(np.float32)  # "within ~10 km"
+        grid = cv2.dilate(grid, kernel).astype(np.float32)  # "within 20 km"
         counts += grid
         combo = daily_setup[d][0] * len(SEASONS) + daily_setup[d][1]
         counts_s[combo] += grid
     n = float(len(days))
-    blur = lambda a: cv2.GaussianBlur(a, (0, 0), CLIM_SMOOTH_CELLS)
+    # Outside the lightning coverage "no strikes" means "not observed": blur only over covered cells
+    # (normalised convolution, so the edge doesn't drag nearby values down) and keep the maps neutral there.
+    cov = hoco_ml.coverage_grid(region, h, w).astype(np.float32)
+    cov_blur = np.maximum(cv2.GaussianBlur(cov, (0, 0), CLIM_SMOOTH_CELLS), 1e-3)
+    blur = lambda a: cv2.GaussianBlur(a * cov, (0, 0), CLIM_SMOOTH_CELLS) / cov_blur
+    inside = cov > 0
     freq = np.clip(blur(counts) / n, 1e-4, 0.6)
+    if inside.any():
+        freq[~inside] = float(freq[inside].mean())
     logit = lambda p: np.log(p / (1 - p))
     f_all = logit(freq)
-    clim = (f_all - f_all.mean()).astype(np.float32)
+    clim = (f_all - (f_all[inside].mean() if inside.any() else f_all.mean())).astype(np.float32)
     setup = np.zeros((n_combo, gh, gw), np.float32)
     for k in range(n_combo):
         shrunk = (blur(counts_s[k]) + SETUP_SHRINK_DAYS * freq) / (ndays_s[k] + SETUP_SHRINK_DAYS)
         setup[k] = logit(np.clip(shrunk, 1e-4, 0.6)) - f_all
+        setup[k][~inside] = 0.0
     return {"clim": clim, "setup": setup, "days": int(n), "setupDays": ndays_s.tolist()}
 
 
@@ -295,10 +303,13 @@ def context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n):
             S * cos_d, S * np.asarray(f_setup), S * cape_n]
 
 
-def apply_context_model(smoothed_fields: dict, params: dict, ctx: dict | None, maps: dict | None, region: str, shape):
-    """Pixel-level probability from a 'context' model."""
+def apply_context_model(smoothed_fields: dict, params: dict, ctx: dict | None, maps: dict | None, region: str, shape,
+                        x_ens=None, grid: bool = False, src_hw=None):
+    """Probability from a 'context' model (pixel level; grid=True for sample-grid previews)."""
     h, w = shape
-    models = params.get("models") or list((params.get("weights") or {}).keys())
+    sh, sw = src_hw or shape
+    smoothed_fields = hoco_ml.prepare_inputs(smoothed_fields, x_ens, params, region, sh, sw, grid)
+    models = params.get("models") or [m for m in (params.get("weights") or {}) if m != hoco_ml.ENS_INPUT]
     z = np.full(shape, float(params.get("intercept", -4.0)), dtype=np.float64)
     for m, wt in (params.get("weights") or {}).items():
         f = smoothed_fields.get(m)

@@ -78,6 +78,27 @@ RISK_BANDS = [
 # training on them would teach the model that storms there never happen.
 AI_REGIONS = {"England", "Scotland", "UK", "Wales", "Ireland and Northern Ireland"}
 
+# Where the lightning feed actually detects strikes (measured from 1.6 M archived strikes, Mar 2025 – Nov 2026):
+# a lon/lat box with a straight south-east edge running from about (-1.9 E, 48.5 N) to (8 E, 51.9 N).
+# Paris, Champagne, eastern France and southern Belgium are OUTSIDE it. Cells outside are never used for
+# training or verification, because "no strike recorded" there does not mean "no lightning".
+LIGHTNING_COVERAGE = {"west": -18.0, "east": 8.0, "south": 48.5, "north": 63.2,
+                      "edge_slope": 0.3491, "edge_offset": 49.1739}
+COVERAGE_MARGIN_DEG = 0.2    # stay ~20 km inside the edge, so a cell's 20 km neighbourhood is fully observed
+
+# What an AI HOCO percentage means: the chance of lightning WITHIN THIS DISTANCE of the point during the
+# window ("storms near here"). Traditional HOCO's model-radius spread and the accuracy checker's 24 km
+# blocks express the same idea. Training labels, climatology maps and verification all use it.
+NEIGHBOURHOOD_KM = 20.0
+
+
+def in_lightning_coverage(lon, lat, margin: float = COVERAGE_MARGIN_DEG):
+    c = LIGHTNING_COVERAGE
+    lon = np.asarray(lon, dtype=np.float64)
+    lat = np.asarray(lat, dtype=np.float64)
+    return ((lon >= c["west"] + margin) & (lon <= c["east"] - margin) & (lat >= c["south"] + margin)
+            & (lat <= c["north"] - margin) & (lat >= c["edge_slope"] * lon + c["edge_offset"] + margin))
+
 
 def canonical_model(name: str) -> str:
     return str(name or "").strip().lower()
@@ -132,6 +153,85 @@ def pool_grid(field: np.ndarray) -> np.ndarray:
 
 def grid_shape(h: int, w: int) -> tuple[int, int]:
     return (math.ceil(h / CELL_PX), math.ceil(w / CELL_PX))
+
+
+def cell_km(region: str, h: int, w: int) -> tuple[float, float]:
+    """Approximate (km per sample cell in x, in y) for a region chart of h x w pixels."""
+    b = region_bounds(region)
+    lat0 = math.radians((b["top"] + b["bottom"]) / 2)
+    kx = (b["right"] - b["left"]) * 111.32 * math.cos(lat0) / w * CELL_PX
+    ky = (b["top"] - b["bottom"]) * 110.57 / h * CELL_PX
+    return kx, ky
+
+
+def neighbourhood_kernel(region: str, h: int, w: int, km: float = NEIGHBOURHOOD_KM) -> np.ndarray:
+    """Elliptical uint8 kernel covering every cell whose centre is within `km` of the middle cell."""
+    kx, ky = cell_km(region, h, w)
+    rx, ry = int(math.ceil(km / kx)), int(math.ceil(km / ky))
+    yy, xx = np.mgrid[-ry:ry + 1, -rx:rx + 1]
+    return (((xx * kx) ** 2 + (yy * ky) ** 2) <= km ** 2).astype(np.uint8)
+
+
+# Learned methods see each model's STRONGEST value within NEIGHBOURHOOD_KM (matching the 20 km question)
+# and, as input "ens", Traditional HOCO's own forecast, so they correct Traditional instead of rebuilding it.
+ENS_INPUT = "ens"
+ENS_FLOOR = 1e-3
+
+
+def ens_feature(x_prob):
+    """Traditional's probability as a non-negative log-odds input (0 at or below 0.1%)."""
+    p = np.clip(np.asarray(x_prob, dtype=np.float64), ENS_FLOOR, 1 - ENS_FLOOR)
+    return (np.log(p / (1 - p)) - math.log(ENS_FLOOR / (1 - ENS_FLOOR))).astype(np.float32)
+
+
+def pixel_neighbourhood_kernel(region: str, h: int, w: int, km: float = NEIGHBOURHOOD_KM) -> np.ndarray:
+    kx, ky = cell_km(region, h, w)
+    px_x, px_y = kx / CELL_PX, ky / CELL_PX
+    rx, ry = int(math.ceil(km / px_x)), int(math.ceil(km / px_y))
+    yy, xx = np.mgrid[-ry:ry + 1, -rx:rx + 1]
+    return (((xx * px_x) ** 2 + (yy * px_y) ** 2) <= km ** 2).astype(np.uint8)
+
+
+def pool_fields(fields: dict, region: str, h: int, w: int, km: float, grid: bool) -> dict:
+    """Each field -> its maximum within `km`, computed on the training sample grid so live runs see exactly
+    what training saw. grid=True: fields are already on that grid; False: full-size fields (pooled on the
+    grid, then scaled back up to full size)."""
+    if not km:
+        return dict(fields)
+    k = neighbourhood_kernel(region, h, w, km)
+    out = {}
+    for m, f in fields.items():
+        if f is None:
+            out[m] = None
+            continue
+        f = np.asarray(f, dtype=np.float32)
+        if grid:
+            out[m] = cv2.dilate(f, k)
+        else:
+            g = cv2.dilate(np.ascontiguousarray(sample_grid(f)), k)
+            # each grid value covers the pixels nearest to its sample point (pixel 7*i -> cell i exactly)
+            idx_r = np.minimum((np.arange(f.shape[0]) + CELL_PX // 2) // CELL_PX, g.shape[0] - 1)
+            idx_c = np.minimum((np.arange(f.shape[1]) + CELL_PX // 2) // CELL_PX, g.shape[1] - 1)
+            out[m] = g[np.ix_(idx_r, idx_c)]
+    return out
+
+
+def prepare_inputs(fields: dict, x_ens, params: dict, region: str, h: int, w: int, grid: bool = False) -> dict:
+    """The exact inputs a learned 'weights' or 'context' model was trained on."""
+    out = pool_fields(fields, region, h, w, float(params.get("inputPoolKm") or 0), grid)
+    if ENS_INPUT in (params.get("weights") or {}) and x_ens is not None:
+        out[ENS_INPUT] = ens_feature(x_ens)
+    return out
+
+
+def coverage_grid(region: str, h: int, w: int) -> np.ndarray:
+    """Boolean (gh, gw) mask of sample-grid cells inside the lightning coverage."""
+    b = region_bounds(region)
+    gh, gw = grid_shape(h, w)
+    lon = b["left"] + (np.arange(gw) * CELL_PX) / w * (b["right"] - b["left"])
+    lat = b["top"] - (np.arange(gh) * CELL_PX) / h * (b["top"] - b["bottom"])
+    LON, LAT = np.meshgrid(lon, lat)
+    return in_lightning_coverage(LON, LAT)
 
 
 def lonlat_to_cell(lon, lat, region: str, h: int, w: int):
@@ -291,10 +391,13 @@ def pick_ai_method(ai_doc: dict | None, bucket: str):
     return entry
 
 
-def predict_method(entry: dict, x_ens: np.ndarray, model_fields: dict) -> np.ndarray:
-    """Probability from a published/candidate method. model_fields are SMOOTHED per-model fields."""
+def predict_method(entry: dict, x_ens: np.ndarray, model_fields: dict, region: str = "England",
+                   src_hw=None, grid: bool = False) -> np.ndarray:
+    """Probability from a published/candidate method. model_fields are SMOOTHED per-model fields.
+    src_hw = (height, width) of the full-size chart (needed for the 20 km input pooling)."""
     params = entry["params"]
     if entry["kind"] == "weights":
         shape = np.shape(x_ens)
-        return apply_logistic(model_fields, params, shape)
+        h, w = src_hw or shape
+        return apply_logistic(prepare_inputs(model_fields, x_ens, params, region, h, w, grid), params, shape)
     return apply_isotonic(x_ens, params)

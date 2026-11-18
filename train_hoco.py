@@ -36,6 +36,7 @@ import sys
 import time
 from datetime import datetime, timedelta, timezone
 
+import cv2
 import numpy as np
 import requests
 from scipy.optimize import minimize
@@ -71,6 +72,7 @@ MIN_FIT_POS, MIN_FIT_RUNS = 200, 20
 MIN_BRIER_IMPROVEMENT = 0.01    # must beat baseline on held-out runs: Brier -1% ...
 MIN_LOGLOSS_IMPROVEMENT = 0.05  # ... or log-loss -5%, and never be worse on either
 L2 = 1e-3
+INPUT_POOL_KM = hoco_ml.NEIGHBOURHOOD_KM   # learned methods see each model's max within 20 km
 
 CTX_COLS = ["region_i", "fh", "fw", "crow", "ccol", "ctx_ok", "doy", "setup", "season", "cape", "u500", "v500", "s", "s_down"]
 COLS = ["run", "bucket", "t_end", "x_ens", "label", "weight"] + [f"m_{m}" for m in hoco_ml.LIGHTNING_MODELS] + CTX_COLS
@@ -271,13 +273,15 @@ def parse_hoco_time(value):
 
 
 def label_grid(strikes, region, h, w):
+    """1 where any strike fell within NEIGHBOURHOOD_KM (20 km) of the cell during the window."""
     gh, gw = hoco_ml.grid_shape(h, w)
-    label = np.zeros((gh, gw), dtype=np.int8)
+    label = np.zeros((gh, gw), dtype=np.uint8)
     if len(strikes):
         r, c = hoco_ml.lonlat_to_cell(strikes[:, 0], strikes[:, 1], region, h, w)
         ok = r >= 0
         label[r[ok], c[ok]] = 1
-    return label
+        label = cv2.dilate(label, hoco_ml.neighbourhood_kernel(region, h, w))
+    return label.astype(np.int8)
 
 
 DEFAULT_SHAPE = (620, 800)   # cloud.py crops every chart to 620 rows; 800 is the default width
@@ -342,6 +346,8 @@ def rows_from_grids(run_idx, bucket_idx, t_end_days, x_ens, label, model_grids, 
     signal = (x >= SIGNAL_EPS) | any_model
     keep_p = np.where(y == 1, 1.0, np.where(signal, KEEP_SIGNAL_NEG, KEEP_QUIET_NEG))
     keep = rng.random(n) < keep_p
+    if size[0] and size[1]:   # never learn from cells the lightning feed cannot see
+        keep &= hoco_ml.coverage_grid(region, size[0], size[1]).reshape(-1)[:n]
     out = {
         "run": np.full(keep.sum(), run_idx, dtype=np.int32),
         "bucket": np.full(keep.sum(), bucket_idx, dtype=np.int8),
@@ -391,6 +397,7 @@ def build_run_rows(run_id, run, strikes, gcs, run_idx, rng):
         SHAPE_HINT[region] = (h, w)
         x_ens = np.clip(arrays["ensemble"] * 0.2, 0, 1)  # raw ensemble, BEFORE calibration
         model_grids = {k[2:]: v for k, v in arrays.items() if k.startswith("m_")}
+        model_grids = hoco_ml.pool_fields(model_grids, region, h, w, INPUT_POOL_KM, grid=True)
         label = label_grid(win, region, h, w)
         ctx = meta.get("context") or (CTX.run_ctx(region, start, end) if CTX else None)
         present = [m for m in hoco_ml.LIGHTNING_MODELS if m in model_grids]
@@ -450,6 +457,28 @@ def save_rows(gcs, rows, run_ids):
                         **{c: rows[c] for c in COLS})
     gcs.blob(ROWS_BLOB).upload_from_string(buf.getvalue(), content_type="application/octet-stream")
     print(f"[CACHE] Saved {len(rows['label'])} rows from {len(run_ids)} runs ({len(buf.getvalue()) / 1e6:.1f} MB).")
+
+
+def coverage_filter(rows):
+    """Drop cached rows that lie outside the lightning coverage (also fixes caches built before the mask)."""
+    n = len(rows["label"])
+    if not n or "crow" not in rows:
+        return rows
+    keep = np.ones(n, dtype=bool)
+    combos = np.unique(np.stack([rows["region_i"], rows["fh"], rows["fw"]], axis=1), axis=0)
+    for ri, fh, fw in combos:
+        if fh <= 0 or fw <= 0:
+            continue
+        region = REGION_LIST[int(ri)] if 0 <= int(ri) < len(REGION_LIST) else "England"
+        grid = hoco_ml.coverage_grid(region, int(fh), int(fw))
+        sel = (rows["region_i"] == ri) & (rows["fh"] == fh) & (rows["fw"] == fw)
+        r = np.clip(rows["crow"][sel].astype(np.int64), 0, grid.shape[0] - 1)
+        c = np.clip(rows["ccol"][sel].astype(np.int64), 0, grid.shape[1] - 1)
+        keep[np.nonzero(sel)[0]] = grid[r, c]
+    if (~keep).any():
+        print(f"[COVERAGE] Ignoring {int((~keep).sum())} of {n} rows outside the lightning coverage "
+              f"({int(rows['label'][~keep].sum())} of them had strikes).")
+    return subset(rows, keep)
 
 
 def concat_rows(a, b):
@@ -626,12 +655,13 @@ def fit_context_params(rows, models, maps):
         "downstream": round(float(theta[1 + k]), 5),
         "downstreamHours": hoco_context.DOWNSTREAM_HOURS,
         "context": {c: round(float(v), 5) for c, v in zip(hoco_context.CONTEXT_COLS, theta[2 + k:])},
-        "models": list(models),
+        "models": [m for m in models if m != hoco_ml.ENS_INPUT],   # the model mean S uses real models only
+        "inputPoolKm": INPUT_POOL_KM,
     }, ok
 
 
 def predict_context(params, rows, maps):
-    models = params.get("models") or list(params["weights"].keys())
+    models = list(params["weights"].keys())   # same order as fitted (includes "ens" when used)
     Xpos, C = context_design(rows, models, maps)
     theta = np.concatenate([[params["intercept"]], [params["weights"].get(m, 0.0) for m in models],
                             [params.get("downstream", 0.0)],
@@ -656,8 +686,7 @@ def train_context(rows, version, trained_at, models_hint=None):
             "needs": {"positives": MIN_CTX_POS, "runs": MIN_CTX_RUNS}}
     if CTX is None or n_runs < MIN_CTX_RUNS or n_pos < MIN_CTX_POS:
         return info
-    models = [m for m in hoco_ml.LIGHTNING_MODELS
-              if np.mean(np.isfinite(rows[f"m_{m}"])) > 0.2 and np.nanmax(rows[f"m_{m}"]) > 0]
+    models = learn_inputs(rows)
     train, val = split_by_time(rows)
     if train is None or val["label"].sum() < 20:
         info["status"] = "insufficient_validation"
@@ -794,7 +823,19 @@ def fit_isotonic(x, y, w, max_knots=60):
 # Stage 2 — non-negative logistic regression (the learned weights)
 # ============================================================================
 def feature_matrix(rows, models):
-    return np.column_stack([np.nan_to_num(np.maximum(rows[f"m_{m}"], 0), nan=0.0) for m in models]).astype(np.float64)
+    cols = []
+    for m in models:
+        if m == hoco_ml.ENS_INPUT:   # Traditional's own forecast as an input
+            cols.append(hoco_ml.ens_feature(rows["x_ens"]).astype(np.float64))
+        else:
+            cols.append(np.nan_to_num(np.maximum(rows[f"m_{m}"], 0), nan=0.0))
+    return np.column_stack(cols).astype(np.float64)
+
+
+def learn_inputs(rows):
+    """Models with enough data, plus Traditional's own forecast."""
+    return [m for m in hoco_ml.LIGHTNING_MODELS
+            if np.mean(np.isfinite(rows[f"m_{m}"])) > 0.2 and np.nanmax(rows[f"m_{m}"]) > 0] + [hoco_ml.ENS_INPUT]
 
 
 def fit_logistic(X, y, w):
@@ -876,8 +917,7 @@ def train_weights(rows, version, trained_at, calibration_info):
     if n_runs < MIN_FIT_RUNS or info["nPositives"] < MIN_FIT_POS:
         return info
 
-    models = [m for m in hoco_ml.LIGHTNING_MODELS
-              if np.mean(np.isfinite(rows[f"m_{m}"])) > 0.2 and np.nanmax(rows[f"m_{m}"]) > 0]
+    models = learn_inputs(rows)
     train, val = split_by_time(rows)
     if train is None or val["label"].sum() < 20:
         info["status"] = "insufficient_validation"
@@ -913,6 +953,7 @@ def train_weights(rows, version, trained_at, calibration_info):
         "version": version, "trainedAt": trained_at,
         "intercept": round(b0, 5),
         "weights": {m: round(float(v), 5) for m, v in zip(models, wts)},
+        "inputPoolKm": INPUT_POOL_KM,
         "importance": {m: round(float(v), 4) for m, v in zip(models, importance)},
         "baseRate": round(float(hoco_ml.sigmoid(b0)), 5),
         "validation": {"baselineName": base_name, "baseline": base, "model": new,
@@ -982,13 +1023,16 @@ def predict_rows(kind, params, rows):
         return hoco_ml.apply_isotonic(x, params).astype(np.float64)
     z = np.full(len(x), float(params.get("intercept", -4.0)))
     for m, wt in (params.get("weights") or {}).items():
+        if m == hoco_ml.ENS_INPUT:
+            z += float(wt) * hoco_ml.ens_feature(x).astype(np.float64)
+            continue
         col = rows.get(f"m_{m}")
         if col is not None:
             z += float(wt) * np.nan_to_num(np.maximum(col, 0), nan=0.0)
     return hoco_ml.sigmoid(z)
 
 
-CONTEXT_PARAM_KEYS = ("intercept", "weights", "downstream", "downstreamHours", "context", "models")
+CONTEXT_PARAM_KEYS = ("intercept", "weights", "downstream", "downstreamHours", "context", "models", "inputPoolKm")
 
 
 def build_candidate(calibration, weights, rows, context=None, climatology_path=None):
@@ -1000,6 +1044,22 @@ def build_candidate(calibration, weights, rows, context=None, climatology_path=N
     sections = [("context", context or {}), ("weights", weights), ("calibration", calibration)]
     candidate = {}
     for b in BUCKETS:
+        # Fair comparison: when a per-model method (weights/context) is available for this day, every
+        # method is scored on the SAME held-out rows (runs with per-model data). Otherwise calibration,
+        # scored on all runs (many quiet, legacy ones), would always look better than it really is.
+        feature_mode = any((sec.get(scope) or {}).get("status") == "active"
+                           for kind, sec in sections if kind != "calibration" for scope in (b, "pooled"))
+        options = _candidate_options(b, sections, rows, climatology_path, feature_mode)
+        if not options and feature_mode:
+            options = _candidate_options(b, [s_ for s_ in sections if s_[0] == "calibration"], rows,
+                                         climatology_path, False)
+        if options:
+            candidate[b] = min(options, key=lambda e: e["vsTraditional"]["model"]["brier"])
+            candidate[b]["comparedOn"] = "runs with per-model data" if feature_mode else "all runs"
+    return candidate
+
+
+def _candidate_options(b, sections, rows, climatology_path, feature_mode):
         options = []
         for kind, section in sections:
             for scope in (b, "pooled"):
@@ -1012,6 +1072,8 @@ def build_candidate(calibration, weights, rows, context=None, climatology_path=N
                     params["_maps"] = info.get("_maps")
                 elif kind == "weights":
                     params = {"intercept": info["intercept"], "weights": info["weights"]}
+                    if info.get("inputPoolKm"):
+                        params["inputPoolKm"] = info["inputPoolKm"]
                 else:
                     params = {"x": info["x"], "y": info["y"]}
                 entry = {
@@ -1022,7 +1084,7 @@ def build_candidate(calibration, weights, rows, context=None, climatology_path=N
                 }
                 if kind == "context":
                     entry["setupEffects"] = info.get("setupEffects")
-                cmp = heldout_compare(entry, rows, b, reference=None)
+                cmp = heldout_compare(entry, rows, b, reference=None, feature_rows=feature_mode)
                 if cmp is None:
                     continue
                 m, t = cmp["candidate"], cmp["reference"]
@@ -1032,9 +1094,7 @@ def build_candidate(calibration, weights, rows, context=None, climatology_path=N
                                               "reliabilityTraditional": cmp["reliabilityReference"]}
                     options.append(entry)
                     break
-        if options:
-            candidate[b] = min(options, key=lambda e: e["vsTraditional"]["model"]["brier"])
-    return candidate
+        return options
 
 
 def strip_private(candidate):
@@ -1047,13 +1107,14 @@ def strip_private(candidate):
     return clean
 
 
-def heldout_compare(cand, rows, bucket, reference=None):
+def heldout_compare(cand, rows, bucket, reference=None, feature_rows=False):
     """
     Refit the candidate WITHOUT the newest 25% of this day's runs, score it on them,
     and score `reference` (a published entry, or Traditional HOCO when None) on the same rows.
     """
     feat = has_features_mask(rows) & (np.isfinite(rows["s"]) if "s" in rows else True)
-    need_feat = cand["kind"] in ("weights", "context") or (reference or {}).get("kind") in ("weights", "context")
+    need_feat = (feature_rows or cand["kind"] in ("weights", "context")
+                 or (reference or {}).get("kind") in ("weights", "context"))
     usable = feat if need_feat else np.ones(len(feat), dtype=bool)
     rows_b = subset(rows, usable & (rows["bucket"] == BUCKETS.index(bucket)))
     if len(rows_b["label"]) == 0:
@@ -1212,6 +1273,7 @@ def main():
     if len(rows["label"]):
         keep = rows["t_end"] >= oldest.timestamp() / 86400
         rows = subset(rows, keep)
+        rows = coverage_filter(rows)
 
     if not args.dry_run:
         save_rows(gcs, rows, run_ids)
