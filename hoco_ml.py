@@ -310,6 +310,94 @@ def read_feature_npz(data: bytes) -> tuple[dict, dict]:
 # ---------------------------------------------------------------------------
 # Learned-model application
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# AI HOCO safeguards (applied to every AI method, in training scores, previews and live runs alike)
+# ---------------------------------------------------------------------------
+#  1. No storm signal -> no AI risk: where Traditional is below 1% AND no model shows storms within 20 km,
+#     AI may not go above Traditional. Stops the faint 5-10% "wash" the context/calibration terms put down
+#     over quiet areas.
+#  2. Boosts need agreement: AI can raise a spot above Traditional only as far as the models agree there
+#     (share of the available models showing storms within 20 km). One model on its own -> no boost;
+#     about 60% of models or more -> the full learned boost. Lowering is never limited.
+#  3. Outside the lightning coverage (N France and beyond) AI has nothing to learn from or be checked
+#     against, so it hands back to Traditional, fading over ~40 km so there is no edge line.
+GUARD_SIGNAL_X = 0.01          # same "signal" test as the training rows
+GUARD_SIGNAL_MODEL = 0.05
+GUARD_AGREE_NONE = 0.25        # share of models agreeing at/below which AI cannot boost
+GUARD_AGREE_FULL = 0.60        # share at/above which the full boost is allowed
+GUARD_COVER_FADE_DEG = 0.4     # fade from AI to Traditional over this distance inside the coverage edge
+
+
+def agreement(pooled_fields: dict, shape):
+    """(share of available models with a storm signal, number agreeing) per cell; inputs are the 20 km-pooled
+    fields. A model counts as available in a cell when its value there is finite (NaN = model missing)."""
+    n_agree = np.zeros(shape, np.float32)
+    n_have = np.zeros(shape, np.float32)
+    for m, f in (pooled_fields or {}).items():
+        if m == ENS_INPUT or f is None:
+            continue
+        f = np.asarray(f, dtype=np.float32)
+        if f.shape != tuple(shape):
+            continue
+        ok = np.isfinite(f)
+        n_have += ok
+        n_agree += ok & (np.nan_to_num(f, nan=0.0) > GUARD_SIGNAL_MODEL)
+    share = np.where(n_have > 0, n_agree / np.maximum(n_have, 1), 0.0).astype(np.float32)
+    return share, n_agree
+
+
+def coverage_weight(region: str, shape, grid_hw=None) -> np.ndarray:
+    """1 well inside the lightning coverage, 0 outside, smooth in between. shape = output (h, w);
+    grid_hw = full chart size when the output is on the sample grid."""
+    b = region_bounds(region)
+    h, w = shape
+    lon = b["left"] + (np.arange(w) + 0.5) / w * (b["right"] - b["left"])
+    lat = b["top"] - (np.arange(h) + 0.5) / h * (b["top"] - b["bottom"])
+    LON, LAT = np.meshgrid(lon, lat)
+    c = LIGHTNING_COVERAGE
+    coslat = np.cos(np.radians(LAT))
+    d = np.minimum.reduce([(LON - c["west"]) * coslat, (c["east"] - LON) * coslat, LAT - c["south"], c["north"] - LAT,
+                           (LAT - (c["edge_slope"] * LON + c["edge_offset"])) / math.sqrt(1 + c["edge_slope"] ** 2)])
+    t = np.clip((d - COVERAGE_MARGIN_DEG) / GUARD_COVER_FADE_DEG, 0, 1)
+    return (t * t * (3 - 2 * t)).astype(np.float32)
+
+
+def guard_ai(p_ai, x_ens, pooled_fields: dict | None, region: str | None = None, cover=True, recent=None):
+    """Apply the three safeguards. p_ai, x_ens: probabilities (same shape). pooled_fields: model fields already
+    pooled to their 20 km maximum, on the same grid. region=None skips the coverage hand-back (training rows
+    are all inside the coverage). recent: observed recent-lightning strength 0..1 on the same grid (or None);
+    real strikes count as a storm signal and as agreement, so AI may raise risk where storms are already going."""
+    p = np.asarray(p_ai, dtype=np.float64)
+    x = np.clip(np.asarray(x_ens, dtype=np.float64), 0, 1)
+    share, n_agree = agreement(pooled_fields, p.shape)
+    r = np.zeros(p.shape) if recent is None else np.clip(np.nan_to_num(np.asarray(recent, dtype=np.float64)), 0, 1)
+    signal = (x >= GUARD_SIGNAL_X) | (n_agree > 0) | (r > 0)
+    p = np.where(signal, p, np.minimum(p, x))                                       # 1
+    a = np.clip((share - GUARD_AGREE_NONE) / (GUARD_AGREE_FULL - GUARD_AGREE_NONE), 0, 1)
+    a = np.where(n_agree >= 2, a, 0.0)                                               # a lone model never boosts
+    a = np.maximum(a, r)                                                             # ... unless storms are observed
+    p = np.where(p > x, x + (p - x) * a, p)                                          # 2
+    if cover and region:
+        cw = coverage_weight(region, p.shape)
+        p = cw * p + (1 - cw) * x                                                    # 3
+    return p.astype(np.float32)
+
+
+_AUTO_ISSUE_RE = re.compile(r"^AUTO-(\d{12,13})")
+
+
+def issue_ms_from_id(job_id: str, fallback_dt: datetime | None = None):
+    """When a run was issued (ms). AUTO ids carry it; otherwise the run's start time."""
+    m = _AUTO_ISSUE_RE.match(job_id or "")
+    if m:
+        return float(m.group(1))
+    if fallback_dt is None:
+        return None
+    if fallback_dt.tzinfo is None:
+        fallback_dt = fallback_dt.replace(tzinfo=timezone.utc)
+    return fallback_dt.timestamp() * 1000.0
+
+
 def sigmoid(z):
     return 1.0 / (1.0 + np.exp(-np.clip(z, -40, 40)))
 

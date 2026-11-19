@@ -54,7 +54,8 @@ ANCHORS = {
     "Ireland and Northern Ireland": [(53.4, -7.7), (54.6, -6.5)],
 }
 
-CONTEXT_COLS = ["f_clim", "f_setup", "cos_doy", "sin_doy", "cape_n", "s_cos", "s_setup", "s_cape"]
+CONTEXT_COLS = ["f_clim", "f_setup", "cos_doy", "sin_doy", "cape_n", "s_cos", "s_setup", "s_cape",
+                "r_near", "r_down", "r_dom", "s_rdom", "k_cons", "k_trend", "sc", "s_sc", "sc_ok"]
 CONTEXT_LABELS = {
     "f_clim": "Where lightning usually happens",
     "f_setup": "Where lightning happens in this setup",
@@ -64,7 +65,25 @@ CONTEXT_LABELS = {
     "s_cos": "Trust in models by season",
     "s_setup": "Trust in models by setup & place",
     "s_cape": "Trust in models by instability",
+    "r_near": "Lightning nearby just before the run",
+    "r_down": "Recent lightning moving this way",
+    "r_dom": "Storms already active in the region",
+    "s_rdom": "Trust in models when storms are active",
+    "k_cons": "Model runs agreeing run after run",
+    "k_trend": "Newest model runs trending up (vs older runs)",
+    "sc": "Severe-storm ingredients (supercell composite)",
+    "s_sc": "Trust in models where severe ingredients are present",
+    "sc_ok": "Supercell charts available for this run",
 }
+
+# Recent lightning: what the strike feed showed just before the run was issued. Traditional HOCO never sees this.
+RECENT_HOURS = 3.0           # strikes in the last 3 h before issue ...
+RECENT_KM = 30.0             # ... within 30 km of the cell
+RECENT_DOWN_HOURS = 3.0      # the same strikes moved along the 500 hPa steering flow for 3 h
+RECENT_DOMAIN_HOURS = 6.0    # any lightning in the region in the last 6 h
+RECENT_NEAR_SAT = 50.0       # strikes for a full-strength local signal
+RECENT_DOMAIN_SAT = 2000.0   # strikes for a full-strength "storms are active" signal
+METOFFICE_LIGHTNING_URL = "https://data.consumer-digital.api.metoffice.gov.uk/v1/lightning"
 
 
 # ---------------------------------------------------------------------------
@@ -295,17 +314,277 @@ def clim_lookup(maps: dict | None, region: str, h: int, w: int, ctx: dict | None
     return m["clim"], f_setup
 
 
-def context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n):
+def context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n, r_near=0.0, r_down=0.0, r_dom=0.0,
+                    k_cons=0.0, k_trend=0.0, sc=0.0, sc_ok=0.0):
     """Columns in CONTEXT_COLS order; inputs are same-shape arrays or scalars."""
     S = np.asarray(S, dtype=np.float64)
     ones = np.ones_like(S)
     return [np.asarray(f_clim) * ones, np.asarray(f_setup) * ones, cos_d * ones, sin_d * ones, cape_n * ones,
-            S * cos_d, S * np.asarray(f_setup), S * cape_n]
+            S * cos_d, S * np.asarray(f_setup), S * cape_n,
+            np.asarray(r_near) * ones, np.asarray(r_down) * ones, np.asarray(r_dom) * ones, S * np.asarray(r_dom),
+            np.asarray(k_cons) * ones, np.asarray(k_trend) * ones,
+            np.asarray(sc) * ones, S * np.asarray(sc), np.asarray(sc_ok) * ones]
+
+
+# ---------------------------------------------------------------------------
+# Supercell composite (severe-storm ingredients) from the models that publish it
+# ---------------------------------------------------------------------------
+SC_PREFIX = "ml/features_sc"     # Storage: one small file per run, {sc_<model code>: peak value on the sample grid}
+SC_SAT = 8.0                     # composite value treated as "full strength"
+SC_STEP_HOURS = 3                # charts are read every 3 valid hours (the ingredients change slowly)
+# Chart colour -> composite value (RGB). Filled from the probe charts; pixels far from every colour = 0.
+SC_PALETTE = [                   # [((r, g, b), value)] from the chart legend; each band counts as its lower edge
+    ((210, 233, 255), 0.2), ((117, 186, 255), 0.5), ((0, 105, 210), 1.0), ((20, 143, 27), 2.0),
+    ((99, 237, 7), 3.0), ((255, 244, 43), 4.0), ((232, 220, 0), 6.0), ((255, 127, 39), 8.0),
+    ((247, 30, 84), 10.0), ((136, 0, 0), 15.0), ((100, 0, 127), 20.0), ((194, 0, 251), 25.0),
+    ((221, 102, 255), 30.0), ((235, 166, 255), 40.0), ((185, 122, 87), 50.0),
+]
+SC_TOLERANCE = 18
+
+
+def decode_supercell(img_bgr):
+    """Composite value per pixel from one chart image (BGR, already cropped to the map)."""
+    img = np.asarray(img_bgr, dtype=np.int16)
+    out = np.zeros(img.shape[:2], np.float32)
+    best = np.full(img.shape[:2], SC_TOLERANCE + 1, np.int16)
+    for (r, g, b), val in SC_PALETTE:
+        d = np.max(np.abs(img - np.array([b, g, r], np.int16)), axis=2)
+        hit = d < best
+        out[hit] = val
+        best[hit] = d[hit]
+    out[best > SC_TOLERANCE] = 0.0
+    return out
+
+
+def pool_max(field: np.ndarray) -> np.ndarray:
+    """Maximum over each sample-grid cell (CELL_PX x CELL_PX)."""
+    f = np.asarray(field, dtype=np.float32)
+    h, w = f.shape
+    gh, gw = hoco_ml.grid_shape(h, w)
+    c = hoco_ml.CELL_PX
+    pad = np.zeros((gh * c, gw * c), np.float32)
+    pad[:h, :w] = f
+    return pad.reshape(gh, c, gw, c).max(axis=(1, 3))
+
+
+def build_sc_npz(sc_grids: dict, meta: dict) -> bytes:
+    arrays = {f"sc_{m}": np.asarray(g, np.float32).astype(np.float16) for m, g in sc_grids.items() if g is not None}
+    arrays["meta"] = np.frombuffer(json.dumps(meta).encode("utf-8"), dtype=np.uint8)
+    buf = io.BytesIO()
+    np.savez_compressed(buf, **arrays)
+    return buf.getvalue()
+
+
+def read_sc_npz(data: bytes):
+    with np.load(io.BytesIO(data), allow_pickle=False) as npz:
+        meta = json.loads(bytes(npz["meta"]).decode("utf-8"))
+        grids = {k[3:]: npz[k].astype(np.float32) for k in npz.files if k.startswith("sc_")}
+    return meta, grids
+
+
+def supercell_input(sc_grids: dict | None, region: str, h: int, w: int):
+    """{'sc': (gh, gw) 0..1 strongest composite within 20 km over the available models, 'ok': 1} or None."""
+    grids = [np.nan_to_num(np.asarray(g, np.float32)) for g in (sc_grids or {}).values() if g is not None]
+    if not grids:
+        return None
+    gh, gw = hoco_ml.grid_shape(h, w)
+    m = np.zeros((gh, gw), np.float32)
+    for g in grids:
+        g = g[:gh, :gw]
+        m[:g.shape[0], :g.shape[1]] = np.maximum(m[:g.shape[0], :g.shape[1]], g)
+    m = cv2.dilate(m, hoco_ml.neighbourhood_kernel(region, h, w, hoco_ml.NEIGHBOURHOOD_KM))
+    return {"sc": np.minimum(np.log1p(np.maximum(m, 0)) / math.log1p(SC_SAT), 1.0).astype(np.float32), "ok": 1.0}
+
+
+# ---------------------------------------------------------------------------
+# Run-to-run behaviour of each model (from the per-run 'raw blocks' saved with every run since schema 2)
+# ---------------------------------------------------------------------------
+TREND_SIGNAL = 1e-3   # a model run "shows storms" in a cell when its pooled raw signal is above this
+
+
+def run_trend(blocks, region: str, h: int, w: int):
+    """blocks: [(model, rank, grid)] with grid = hoco_ml.pool_grid(raw field) summed over one 6-h block
+    (rank 0 = the model's newest run). Returns {'cons', 'trend'}: (gh, gw) grids, or None if nothing usable.
+      cons  = share of all (model, run) pairs showing storms within 20 km  -> agreement run after run
+      trend = (share of models whose NEWEST run shows storms) - (share whose OLDER runs did), over models
+              with both, within 20 km -> +1 newly appeared, -1 dropped by the latest runs."""
+    if not blocks:
+        return None
+    gh, gw = hoco_ml.grid_shape(h, w)
+    per = {}   # (model, rank) -> max over blocks
+    for model, rank, g in blocks:
+        if g is None:
+            continue
+        g = np.nan_to_num(np.asarray(g, dtype=np.float32)[:gh, :gw])
+        if g.shape != (gh, gw):
+            pad = np.zeros((gh, gw), np.float32)
+            pad[:g.shape[0], :g.shape[1]] = g
+            g = pad
+        key = (model, int(rank))
+        per[key] = np.maximum(per[key], g) if key in per else g
+    if not per:
+        return None
+    k = hoco_ml.neighbourhood_kernel(region, h, w, hoco_ml.NEIGHBOURHOOD_KM)
+    shows = {key: cv2.dilate((g > TREND_SIGNAL).astype(np.uint8), k).astype(np.float32) for key, g in per.items()}
+    cons = sum(shows.values()) / len(shows)
+    models = {m for m, _ in shows}
+    up = np.zeros((gh, gw), np.float32)
+    n_both = 0
+    for m in models:
+        ranks = sorted(r for mm, r in shows if mm == m)
+        if len(ranks) < 2 or ranks[0] != 0:
+            continue
+        older = np.mean([shows[(m, r)] for r in ranks[1:]], axis=0)
+        up += shows[(m, 0)] - older
+        n_both += 1
+    trend = up / n_both if n_both else np.zeros((gh, gw), np.float32)
+    return {"cons": cons.astype(np.float32), "trend": trend.astype(np.float32)}
+
+
+def blocks_from_npz(meta: dict, arrays: dict):
+    """[(model, rank, grid)] from a feature file (empty for files saved before schema 2)."""
+    out = []
+    for b in meta.get("raw_blocks") or []:
+        g = arrays.get(b.get("key"))
+        if g is not None and b.get("model") in hoco_ml.LIGHTNING_MODELS:
+            out.append((b["model"], int(b.get("rank", 0)), g))
+    return out
+
+
+def blocks_from_live(raw_blocks):
+    """Same, from cloud.py's in-memory raw blocks (full-size fields, real model names)."""
+    out = []
+    for b in raw_blocks or []:
+        m = hoco_ml.canonical_model(b.get("model"))
+        if m in hoco_ml.LIGHTNING_MODELS and b.get("field") is not None:
+            out.append((m, int(b.get("rank", 0)), hoco_ml.pool_grid(b["field"])))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Recent lightning (observed just before the run was issued)
+# ---------------------------------------------------------------------------
+def recent_lightning(strikes, issue_ms, region: str, h: int, w: int, ctx: dict | None = None):
+    """Strikes just before issue, on the (gh, gw) sample grid of an h x w chart.
+    strikes: array (lon, lat, t_ms) sorted by time. Returns {'near', 'down': grids 0..1, 'dom': 0..1} or None."""
+    if strikes is None or issue_ms is None:
+        return None
+    strikes = np.asarray(strikes, dtype=np.float64).reshape(-1, 3)
+    gh, gw = hoco_ml.grid_shape(h, w)
+    t = strikes[:, 2]
+
+    def window(hours):
+        lo = np.searchsorted(t, issue_ms - hours * 3600e3, side="left")
+        hi = np.searchsorted(t, issue_ms, side="left")       # strictly before issue: no peeking
+        return strikes[lo:hi]
+
+    def cells(s):
+        if not len(s):
+            return np.zeros(0, np.int64), np.zeros(0, np.int64)
+        r, c = hoco_ml.lonlat_to_cell(s[:, 0], s[:, 1], region, h, w)
+        ok = r >= 0
+        return r[ok], c[ok]
+
+    counts = np.zeros((gh, gw), np.float32)
+    r, c = cells(window(RECENT_HOURS))
+    np.add.at(counts, (r, c), 1.0)
+    k = hoco_ml.neighbourhood_kernel(region, h, w, RECENT_KM).astype(np.float32)
+
+    def squash(n, sat):
+        return np.minimum(np.log1p(np.maximum(n, 0)) / math.log1p(sat), 1.0).astype(np.float32)
+
+    near = squash(cv2.filter2D(counts, -1, k, borderType=cv2.BORDER_CONSTANT), RECENT_NEAR_SAT)
+    moved = shift_downstream(counts, ctx, region, h, w, RECENT_DOWN_HOURS)
+    down = squash(cv2.filter2D(np.ascontiguousarray(moved), -1, k, borderType=cv2.BORDER_CONSTANT), RECENT_NEAR_SAT)
+    n_dom = len(cells(window(RECENT_DOMAIN_HOURS))[0])
+    return {"near": near, "down": down, "dom": float(squash(n_dom, RECENT_DOMAIN_SAT))}
+
+
+def recent_signal(recent, shape):
+    """max(near, down) resized to `shape` (for the safeguards), or None."""
+    if not recent:
+        return None
+    g = np.maximum(recent["near"], recent["down"])
+    if g.shape != tuple(shape):
+        g = cv2.resize(g, (shape[1], shape[0]), interpolation=cv2.INTER_LINEAR)
+    return g
+
+
+def _strike_ms(value):
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value) * 1000.0 if value < 1e10 else float(value)
+    s = str(value).strip()
+    if s.isdigit() and 9 <= len(s) <= 13:
+        n = float(s)
+        return n * 1000.0 if n < 1e10 else n
+    if len(s) >= 10 and s[2] == "/" and s[5] == "/":        # dd/mm/yyyy[ hh:mm[:ss]]
+        hms = s[10:].strip(" T") or "00:00:00"
+        s = f"{s[6:10]}-{s[3:5]}-{s[0:2]}T{hms if len(hms) > 5 else hms + ':00'}Z"
+    elif len(s) >= 15 and s[8] == "T" and s[:8].isdigit():  # yyyymmddThhmmss
+        s = f"{s[0:4]}-{s[4:6]}-{s[6:8]}T{s[9:11]}:{s[11:13]}:{s[13:15]}Z"
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp() * 1000.0
+
+
+def fetch_recent_strikes(timeout: int = 60):
+    """The Met Office live feed (about the last 48 h) as an array (lon, lat, t_ms) sorted by time; None on failure."""
+    def get(url):
+        res = requests.get(url, timeout=timeout, headers={"Accept": "application/json"})
+        res.raise_for_status()
+        return res.json()
+
+    def items(d):
+        if isinstance(d, list):
+            return d
+        return d.get("lightning_strikes") or [] if isinstance(d, dict) else []
+
+    try:
+        base = get(METOFFICE_LIGHTNING_URL)
+    except Exception as e:
+        print(f"[RECENT] Met Office lightning feed failed: {e}")
+        return None
+    raw = list(items(base))
+    for c in ((base.get("chunks") or []) if isinstance(base, dict) else []):
+        n = c.get("chunk") if isinstance(c, dict) else c
+        if n is None:
+            continue
+        try:
+            raw += items(get(f"{METOFFICE_LIGHTNING_URL}?last-minutes=1&chunk={n}"))
+        except Exception as e:
+            print(f"[RECENT] chunk {n} failed: {e}")
+    out = []
+    for s in raw:
+        if not isinstance(s, dict):
+            continue
+        c = s.get("coordinates") or (s.get("geometry") or {}).get("coordinates")
+        t = _strike_ms(s.get("strike_time"))
+        if t is None or not isinstance(c, list) or len(c) < 2:
+            continue
+        try:
+            lon, lat = float(c[0]), float(c[1])
+        except (TypeError, ValueError):
+            continue
+        if abs(lon) > 30 and abs(lat) <= 30:
+            lon, lat = lat, lon
+        out.append((lon, lat, t))
+    arr = np.array(out, dtype=np.float64).reshape(-1, 3)
+    arr = arr[np.argsort(arr[:, 2])]
+    print(f"[RECENT] {len(arr)} strikes from the Met Office live feed")
+    return arr
 
 
 def apply_context_model(smoothed_fields: dict, params: dict, ctx: dict | None, maps: dict | None, region: str, shape,
-                        x_ens=None, grid: bool = False, src_hw=None):
-    """Probability from a 'context' model (pixel level; grid=True for sample-grid previews)."""
+                        x_ens=None, grid: bool = False, src_hw=None, recent: dict | None = None,
+                        trend: dict | None = None, supercell: dict | None = None):
+    """Probability from a 'context' model (pixel level; grid=True for sample-grid previews).
+    recent: recent_lightning(...) for this run (None = no strikes seen, i.e. all zero)."""
     h, w = shape
     sh, sw = src_hw or shape
     smoothed_fields = hoco_ml.prepare_inputs(smoothed_fields, x_ens, params, region, sh, sw, grid)
@@ -323,7 +602,21 @@ def apply_context_model(smoothed_fields: dict, params: dict, ctx: dict | None, m
     f_clim = cv2.resize(f_clim, (w, h), interpolation=cv2.INTER_LINEAR)
     f_setup = cv2.resize(f_setup, (w, h), interpolation=cv2.INTER_LINEAR)
     cos_d, sin_d, cape_n = run_scalars(ctx)
-    cols = context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n)
+    r_near = r_down = 0.0
+    r_dom = 0.0
+    if recent:
+        r_near = cv2.resize(recent["near"], (w, h), interpolation=cv2.INTER_LINEAR)
+        r_down = cv2.resize(recent["down"], (w, h), interpolation=cv2.INTER_LINEAR)
+        r_dom = float(recent["dom"])
+    k_cons = k_trend = 0.0
+    if trend:
+        k_cons = cv2.resize(trend["cons"], (w, h), interpolation=cv2.INTER_LINEAR)
+        k_trend = cv2.resize(trend["trend"], (w, h), interpolation=cv2.INTER_LINEAR)
+    sc, sc_ok = 0.0, 0.0
+    if supercell:
+        sc = cv2.resize(supercell["sc"], (w, h), interpolation=cv2.INTER_LINEAR)
+        sc_ok = 1.0
+    cols = context_columns(S, f_clim, f_setup, cos_d, sin_d, cape_n, r_near, r_down, r_dom, k_cons, k_trend, sc, sc_ok)
     coefs = params.get("context") or {}
     for name, col in zip(CONTEXT_COLS, cols):
         z += float(coefs.get(name, 0.0)) * col

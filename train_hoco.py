@@ -74,11 +74,16 @@ MIN_LOGLOSS_IMPROVEMENT = 0.05  # ... or log-loss -5%, and never be worse on eit
 L2 = 1e-3
 INPUT_POOL_KM = hoco_ml.NEIGHBOURHOOD_KM   # learned methods see each model's max within 20 km
 
-CTX_COLS = ["region_i", "fh", "fw", "crow", "ccol", "ctx_ok", "doy", "setup", "season", "cape", "u500", "v500", "s", "s_down"]
+CTX_COLS = ["region_i", "fh", "fw", "crow", "ccol", "ctx_ok", "doy", "setup", "season", "cape", "u500", "v500", "s", "s_down",
+            "r_near", "r_down", "r_dom",   # r_*: observed lightning just before issue (hoco_context.recent_lightning)
+            "k_cons", "k_trend",           # k_*: run-to-run agreement / trend of the models (hoco_context.run_trend)
+            "sc", "sc_ok"]                 # supercell composite (hoco_context.supercell_input); sc_ok 0 = no charts
 COLS = ["run", "bucket", "t_end", "x_ens", "label", "weight"] + [f"m_{m}" for m in hoco_ml.LIGHTNING_MODELS] + CTX_COLS
 REGION_LIST = list(hoco_ml.REGION_BOUNDS.keys())
 MIN_CTX_POS, MIN_CTX_RUNS = 400, 30
 L2_CTX = 3e-3
+L2_RECENT = 1e-5          # recent-lightning terms are on in only ~2% of cells: the usual penalty would erase them
+RECENT_TERMS = ("r_near", "r_down", "r_dom", "s_rdom", "k_cons", "k_trend", "sc", "s_sc")
 CTX = None  # ContextEnv, set in main()
 
 
@@ -333,7 +338,7 @@ def legacy_ensemble_grid(geojson, region):
 
 
 def rows_from_grids(run_idx, bucket_idx, t_end_days, x_ens, label, model_grids, rng, region="England",
-                    size=(0, 0), ctx=None, s_grid=None, s_down=None):
+                    size=(0, 0), ctx=None, s_grid=None, s_down=None, recent=None, trend=None, supercell=None):
     n = x_ens.size
     x = x_ens.reshape(-1)
     y = label.reshape(-1).astype(np.int8)
@@ -373,6 +378,13 @@ def rows_from_grids(run_idx, bucket_idx, t_end_days, x_ens, label, model_grids, 
         "v500": np.full(k, ctx["v500"] if ctx else 0.0, dtype=np.float32),
         "s": (s_grid.reshape(-1)[keep] if s_grid is not None else np.full(k, np.nan)).astype(np.float32),
         "s_down": (s_down.reshape(-1)[keep] if s_down is not None else np.full(k, np.nan)).astype(np.float32),
+        "r_near": (recent["near"].reshape(-1)[keep] if recent else np.full(k, np.nan)).astype(np.float32),
+        "r_down": (recent["down"].reshape(-1)[keep] if recent else np.full(k, np.nan)).astype(np.float32),
+        "r_dom": np.full(k, recent["dom"] if recent else np.nan, dtype=np.float32),
+        "k_cons": (trend["cons"].reshape(-1)[keep] if trend else np.full(k, np.nan)).astype(np.float32),
+        "k_trend": (trend["trend"].reshape(-1)[keep] if trend else np.full(k, np.nan)).astype(np.float32),
+        "sc": (supercell["sc"].reshape(-1)[keep] if supercell else np.full(k, np.nan)).astype(np.float32),
+        "sc_ok": np.full(k, 1.0 if supercell else np.nan, dtype=np.float32),
     })
     return out
 
@@ -403,8 +415,12 @@ def build_run_rows(run_id, run, strikes, gcs, run_idx, rng):
         present = [m for m in hoco_ml.LIGHTNING_MODELS if m in model_grids]
         s_grid = hoco_context.model_mean(model_grids, present)
         s_down = hoco_context.shift_downstream(s_grid, ctx, region, h, w) if s_grid is not None else None
+        recent = hoco_context.recent_lightning(strikes, hoco_ml.issue_ms_from_id(run_id, start), region, h, w, ctx)
+        trend = hoco_context.run_trend(hoco_context.blocks_from_npz(meta, arrays), region, h, w)
+        supercell = hoco_context.supercell_input(load_sc(gcs, run_id), region, h, w)
         return rows_from_grids(run_idx, bucket_idx, end.timestamp() / 86400, x_ens, label, model_grids, rng,
-                               region=region, size=(h, w), ctx=ctx, s_grid=s_grid, s_down=s_down), "features"
+                               region=region, size=(h, w), ctx=ctx, s_grid=s_grid, s_down=s_down,
+                               recent=recent, trend=trend, supercell=supercell), "features"
 
     # Legacy: rebuild ensemble from the geojson point grid (only valid for uncalibrated runs)
     import zlib
@@ -479,6 +495,160 @@ def coverage_filter(rows):
         print(f"[COVERAGE] Ignoring {int((~keep).sum())} of {n} rows outside the lightning coverage "
               f"({int(rows['label'][~keep].sum())} of them had strikes).")
     return subset(rows, keep)
+
+
+def fill_recent(rows, run_ids, strikes):
+    """Add the recent-lightning inputs to cached rows made before they existed (computed from the strike
+    archive at each run's issue time, so nothing has to be rebuilt)."""
+    n = len(rows["label"])
+    if not n:
+        return rows
+    todo = ~np.isfinite(rows["r_near"]) & (rows["fh"] > 0)
+    if not todo.any():
+        return rows
+    done = 0
+    for ri in np.unique(rows["run"][todo]):
+        sel = todo & (rows["run"] == ri)
+        i = int(ri)
+        run_id = run_ids[i] if 0 <= i < len(run_ids) else ""
+        issue = hoco_ml.issue_ms_from_id(run_id)
+        if issue is None:
+            continue
+        j = np.nonzero(sel)[0]
+        k0 = j[0]
+        region = REGION_LIST[int(rows["region_i"][k0])] if 0 <= int(rows["region_i"][k0]) < len(REGION_LIST) else "England"
+        h, w = int(rows["fh"][k0]), int(rows["fw"][k0])
+        ctx = {"u500": float(rows["u500"][k0]), "v500": float(rows["v500"][k0])} if rows["ctx_ok"][k0] == 1 else None
+        rec = hoco_context.recent_lightning(strikes, issue, region, h, w, ctx)
+        r = np.clip(rows["crow"][j].astype(np.int64), 0, rec["near"].shape[0] - 1)
+        c = np.clip(rows["ccol"][j].astype(np.int64), 0, rec["near"].shape[1] - 1)
+        rows["r_near"][j] = rec["near"][r, c]
+        rows["r_down"][j] = rec["down"][r, c]
+        rows["r_dom"][j] = rec["dom"]
+        done += 1
+    print(f"[RECENT] Added recent-lightning inputs to {int(todo.sum())} cached rows from {done} runs.")
+    return rows
+
+
+def recent_report(rows):
+    """One line per day bucket: how often lightning was seen nearby before issue, and the hit rate then vs otherwise."""
+    if not len(rows["label"]):
+        return
+    for bi, b in enumerate(BUCKETS):
+        sel = rows["bucket"] == bi
+        if not sel.any():
+            continue
+        y, w = rows["label"][sel].astype(np.float64), rows["weight"][sel].astype(np.float64)
+        near = np.nan_to_num(rows["r_near"][sel]) > 0
+        known = np.isfinite(rows["r_near"][sel])
+        def rate(m):
+            return 100 * np.sum(w[m] * y[m]) / max(np.sum(w[m]), 1e-9)
+        print(f"[RECENT] {b}: inputs known for {100 * known.mean():.0f}% of rows; lightning nearby before issue in "
+              f"{100 * np.sum(w[near]) / np.sum(w):.1f}% of cells -> hit rate {rate(near):.1f}% there vs {rate(~near):.1f}% elsewhere")
+        if "k_trend" in rows:
+            kt = np.nan_to_num(rows["k_trend"][sel])
+            kc = np.nan_to_num(rows["k_cons"][sel])
+            print(f"[TREND]  {b}: newest runs trending up -> hit rate {rate(kt > 0.2):.1f}%, down -> {rate(kt < -0.2):.1f}%; "
+                  f"most runs agree -> {rate(kc >= 0.6):.1f}%, few runs -> {rate((kc > 0) & (kc < 0.3)):.1f}%")
+        if "sc" in rows:
+            ok = np.nan_to_num(rows["sc_ok"][sel]) > 0
+            scv = np.nan_to_num(rows["sc"][sel])
+            if ok.any():
+                print(f"[SUPERCELL] {b}: charts for {100 * ok.mean():.0f}% of rows; severe ingredients -> hit rate "
+                      f"{rate(ok & (scv >= 0.5)):.1f}%, some -> {rate(ok & (scv > 0) & (scv < 0.5)):.1f}%, none -> {rate(ok & (scv == 0)):.1f}%")
+
+
+def fill_trend(rows, run_ids, gcs):
+    """Add the run-to-run inputs to cached rows made before they existed: one download of each run's
+    feature file. Runs without per-run blocks (saved before schema 2) get 0 so they are not retried."""
+    if not len(rows["label"]):
+        return rows
+    todo = ~np.isfinite(rows["k_cons"]) & (rows["fh"] > 0) & has_features_mask(rows)
+    runs = np.unique(rows["run"][todo])
+    if not len(runs):
+        return rows
+    print(f"[TREND] Reading run-to-run data for {len(runs)} runs (one-off)...")
+    got = 0
+    for n, ri in enumerate(runs):
+        sel = np.nonzero(todo & (rows["run"] == ri))[0]
+        i = int(ri)
+        run_id = run_ids[i] if 0 <= i < len(run_ids) else ""
+        tr = None
+        try:
+            blob = gcs.blob(f"{hoco_ml.FEATURE_PREFIX}/{run_id}.npz")
+            if run_id and blob.exists():
+                meta, arrays = hoco_ml.read_feature_npz(blob.download_as_bytes())
+                region = meta.get("region") or "England"
+                tr = hoco_context.run_trend(hoco_context.blocks_from_npz(meta, arrays), region,
+                                            meta["height"], meta["width"])
+        except Exception as e:
+            print(f"[TREND] {run_id}: {e}")
+        if tr is None:
+            rows["k_cons"][sel] = 0.0
+            rows["k_trend"][sel] = 0.0
+            continue
+        r = np.clip(rows["crow"][sel].astype(np.int64), 0, tr["cons"].shape[0] - 1)
+        c = np.clip(rows["ccol"][sel].astype(np.int64), 0, tr["cons"].shape[1] - 1)
+        rows["k_cons"][sel] = tr["cons"][r, c]
+        rows["k_trend"][sel] = tr["trend"][r, c]
+        got += 1
+        if (n + 1) % 50 == 0:
+            print(f"[TREND]   {n + 1}/{len(runs)}")
+    print(f"[TREND] Added run-to-run inputs for {got} runs ({len(runs) - got} had no per-run data).")
+    return rows
+
+
+def load_sc(gcs, run_id):
+    """Supercell grids saved for a run (backfill or live), or None."""
+    try:
+        blob = gcs.blob(f"{hoco_context.SC_PREFIX}/{run_id}.npz")
+        if run_id and blob.exists():
+            return hoco_context.read_sc_npz(blob.download_as_bytes())[1] or None
+    except Exception as e:
+        print(f"[SUPERCELL] {run_id}: {e}")
+    return None
+
+
+def fill_supercell(rows, run_ids, gcs):
+    """Add supercell inputs to cached rows once their run has supercell charts (rows stay empty until then,
+    so a later supercell backfill is picked up automatically)."""
+    if not len(rows["label"]):
+        return rows
+    todo = ~np.isfinite(rows["sc"]) & (rows["fh"] > 0) & has_features_mask(rows)
+    runs = np.unique(rows["run"][todo])
+    if not len(runs):
+        return rows
+    try:
+        have = {b.name.rsplit("/", 1)[-1][:-4] for b in gcs.list_blobs(prefix=hoco_context.SC_PREFIX + "/")}
+    except Exception:
+        have = None   # listing not possible: check run by run
+    got = 0
+    for ri in runs:
+        i = int(ri)
+        run_id = run_ids[i] if 0 <= i < len(run_ids) else ""
+        if have is not None and run_id not in have:
+            continue
+        grids = load_sc(gcs, run_id)
+        if not grids:
+            continue
+        sel = np.nonzero(todo & (rows["run"] == ri))[0]
+        k0 = sel[0]
+        region = REGION_LIST[int(rows["region_i"][k0])] if 0 <= int(rows["region_i"][k0]) < len(REGION_LIST) else "England"
+        sc = hoco_context.supercell_input(grids, region, int(rows["fh"][k0]), int(rows["fw"][k0]))
+        r = np.clip(rows["crow"][sel].astype(np.int64), 0, sc["sc"].shape[0] - 1)
+        c = np.clip(rows["ccol"][sel].astype(np.int64), 0, sc["sc"].shape[1] - 1)
+        rows["sc"][sel] = sc["sc"][r, c]
+        rows["sc_ok"][sel] = 1.0
+        got += 1
+    print(f"[SUPERCELL] Added supercell inputs for {got} runs ({len(runs) - got} runs have no supercell charts yet).")
+    return rows
+
+
+def row_recent(rows):
+    """Recent-lightning strength per row for the safeguards (0 where unknown)."""
+    if "r_near" not in rows:
+        return None
+    return np.maximum(np.nan_to_num(rows["r_near"].astype(np.float64)), np.nan_to_num(rows["r_down"].astype(np.float64)))
 
 
 def concat_rows(a, b):
@@ -620,7 +790,15 @@ def context_design(rows, models, maps):
     cos_d = np.where(ok, np.cos(ang), 0.0)
     sin_d = np.where(ok, np.sin(ang), 0.0)
     cape_n = np.where(ok, np.log1p(np.maximum(rows["cape"].astype(np.float64), 0)) / np.log1p(1000.0), 0.0)
-    C = np.column_stack(hoco_context.context_columns(s, f_clim, f_setup, cos_d, sin_d, cape_n))
+    r_near = np.nan_to_num(rows["r_near"].astype(np.float64), nan=0.0)
+    r_down = np.nan_to_num(rows["r_down"].astype(np.float64), nan=0.0)
+    r_dom = np.nan_to_num(rows["r_dom"].astype(np.float64), nan=0.0)
+    k_cons = np.nan_to_num(rows["k_cons"].astype(np.float64), nan=0.0)
+    k_trend = np.nan_to_num(rows["k_trend"].astype(np.float64), nan=0.0)
+    sc = np.nan_to_num(rows["sc"].astype(np.float64), nan=0.0)
+    sc_ok = np.nan_to_num(rows["sc_ok"].astype(np.float64), nan=0.0)
+    C = np.column_stack(hoco_context.context_columns(s, f_clim, f_setup, cos_d, sin_d, cape_n, r_near, r_down, r_dom,
+                                                     k_cons, k_trend, sc, sc_ok))
     return np.column_stack([X, sd]), C
 
 
@@ -630,7 +808,8 @@ def fit_glm(Xpos, C, y, w):
     kp, kc = Xpos.shape[1], C.shape[1]
     base = np.clip(np.sum(wn * y), 1e-4, 0.5)
     theta0 = np.concatenate([[np.log(base / (1 - base))], np.full(kp, 0.1), np.zeros(kc)])
-    l2 = np.concatenate([[0.0], np.full(kp, L2), np.full(kc, L2_CTX)])
+    l2_c = np.array([L2_RECENT if c in RECENT_TERMS else L2_CTX for c in hoco_context.CONTEXT_COLS][:kc])
+    l2 = np.concatenate([[0.0], np.full(kp, L2), l2_c])
 
     def loss_grad(theta):
         z = theta[0] + Xpos @ theta[1:1 + kp] + C @ theta[1 + kp:]
@@ -886,7 +1065,8 @@ def train_calibration(rows, version, trained_at):
 
     cal = fit_isotonic(train["x_ens"].astype(np.float64), train["label"].astype(np.float64), train["weight"].astype(np.float64))
     vy, vw, vx = val["label"].astype(np.float64), val["weight"].astype(np.float64), val["x_ens"].astype(np.float64)
-    p_new = hoco_ml.apply_isotonic(vx, cal).astype(np.float64)
+    p_new = hoco_ml.guard_ai(hoco_ml.apply_isotonic(vx, cal), np.clip(vx, 0, 1), row_fields(val),
+                             recent=row_recent(val)).astype(np.float64)
     base = metric_block(np.clip(vx, 0, 1), vy, vw)
     new = metric_block(p_new, vy, vw)
     passes = new["brier"] <= base["brier"] and new["logloss"] <= base["logloss"] and (
@@ -925,7 +1105,9 @@ def train_weights(rows, version, trained_at, calibration_info):
 
     b0, wts, ok = fit_logistic(feature_matrix(train, models), train["label"].astype(np.float64), train["weight"].astype(np.float64))
     vy, vw = val["label"].astype(np.float64), val["weight"].astype(np.float64)
-    p_new = hoco_ml.sigmoid(b0 + feature_matrix(val, models) @ wts)
+    p_new = hoco_ml.guard_ai(hoco_ml.sigmoid(b0 + feature_matrix(val, models) @ wts),
+                             np.clip(val["x_ens"].astype(np.float64), 0, 1), row_fields(val),
+                             recent=row_recent(val)).astype(np.float64)
 
     # Baseline = whatever production would otherwise show: calibrated ensemble if active, else raw
     vx = np.clip(val["x_ens"].astype(np.float64), 0, 1)
@@ -1012,7 +1194,19 @@ def fit_kind(kind, rows, models, cutoff_ms=None):
     return {"intercept": round(b0, 5), "weights": {m: round(float(v), 5) for m, v in zip(models, wts)}}
 
 
+def row_fields(rows):
+    """The 20 km-pooled model fields stored in the rows (NaN where a run had no such model)."""
+    return {m: rows[f"m_{m}"] for m in hoco_ml.LIGHTNING_MODELS if f"m_{m}" in rows}
+
+
 def predict_rows(kind, params, rows):
+    """Scores always include the AI safeguards (hoco_ml.guard_ai), so the Lab judges exactly what users get."""
+    x = np.clip(rows["x_ens"].astype(np.float64), 0, 1)
+    return hoco_ml.guard_ai(predict_rows_raw(kind, params, rows), x, row_fields(rows), region=None,
+                            recent=row_recent(rows)).astype(np.float64)
+
+
+def predict_rows_raw(kind, params, rows):
     x = np.clip(rows["x_ens"].astype(np.float64), 0, 1)
     if kind == "context":
         maps = params.get("_maps")
@@ -1274,6 +1468,10 @@ def main():
         keep = rows["t_end"] >= oldest.timestamp() / 86400
         rows = subset(rows, keep)
         rows = coverage_filter(rows)
+        rows = fill_recent(rows, run_ids, strikes)
+        rows = fill_trend(rows, run_ids, gcs)
+        rows = fill_supercell(rows, run_ids, gcs)
+        recent_report(rows)
 
     if not args.dry_run:
         save_rows(gcs, rows, run_ids)
